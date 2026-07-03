@@ -20,6 +20,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from crowd_sim.utils import absolute_obs_to_relative, build_env, resolve_env_name, select_top_k_obs
 from model.factory import build_model
+from scripts.override_validation import validate_existing_leaf_overrides
 from trainer.utils import resolve_device
 
 
@@ -87,6 +88,8 @@ class Evaluator:
         self.output_suffix = override_suffix(self.overrides)
         self.config = OmegaConf.load(self.save_dir / "config.yaml")
         if self.overrides:
+            validate_existing_leaf_overrides(self.config, self.overrides, context="eval")
+            OmegaConf.set_struct(self.config, True)
             self.config = OmegaConf.merge(self.config, OmegaConf.from_dotlist(self.overrides))
             OmegaConf.resolve(self.config)
             print(f"eval overrides: {' '.join(self.overrides)}", flush=True)
@@ -278,9 +281,12 @@ if __name__ == "__main__":
     parser.add_argument("overrides", nargs="*", help="Eval-only OmegaConf overrides, e.g. env.humans.use_gmm=false")
     args = parser.parse_args()
 
-    Evaluator(
-        args.save_dir,
-        episodes_per_seed=args.episodes_per_seed,
-        visualize=args.visualize,
-        overrides=args.overrides,
-    ).eval_all_ckpts(checkpoint=args.checkpoint or None)
+    try:
+        Evaluator(
+            args.save_dir,
+            episodes_per_seed=args.episodes_per_seed,
+            visualize=args.visualize,
+            overrides=args.overrides,
+        ).eval_all_ckpts(checkpoint=args.checkpoint or None)
+    except ValueError as exc:
+        parser.exit(2, f"{exc}\n")
