@@ -5,7 +5,7 @@ Crowd navigation scneario
 High-density out-of-distribution comparison (2× speed). 
 
 
-| ![RL](docs/assets/rl_seed_158_succ_0_coll_1_2x.gif) | ![RL+SF](docs/assets/rl_sf_seed_158_succ_0_coll_1_2x.gif) | ![CVaR-BF-QP](docs/assets/cvarqp_seed_158_succ_0_coll_1_2x.gif) | ![Ours](docs/assets/rlcvarbetaradius_seed_158_succ_1_coll_0_2x.gif) |
+| RL             | RL+SF                          | CVaR-BF-QP             | Ours               |
 | -------------- | ------------------------------ | ---------------------- | ------------------ |
 | RL — collision | RL + Safety Filter — collision | CVaR-BF-QP — collision | **Ours — success** |
 
@@ -18,7 +18,7 @@ Clone the repository and create the environment:
 git clone https://github.com/anonymousrobotics9666/Reinforcement-Learning-Adaptive-CVaR-Barrier-Function.git
 cd Reinforcement-Learning-Adaptive-CVaR-Barrier-Function
 conda env create -f environment.yml
-conda activate rl-cvar-cbf
+conda activate diff_cvar
 ```
 
 For a CUDA build, install the matching PyTorch wheel for your machine after activating the environment. 
