@@ -1,4 +1,4 @@
-name: rl-cvar-cbf
+name: diff_cvar
 channels:
   - conda-forge
 dependencies:
