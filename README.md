@@ -7,6 +7,7 @@ High-density out-of-distribution comparison (2× speed).
 
 | RL             | RL+SF                          | CVaR-BF-QP             | Ours               |
 | -------------- | ------------------------------ | ---------------------- | ------------------ |
+| ![RL collision](./docs/assets/rl_seed_158_succ_0_coll_1_2x.gif) | ![RL with safety filter collision](./docs/assets/rl_sf_seed_158_succ_0_coll_1_2x.gif) | ![CVaR-BF-QP collision](./docs/assets/cvarqp_seed_158_succ_0_coll_1_2x.gif) | ![Proposed method success](./docs/assets/rlcvarbetaradius_seed_158_succ_1_coll_0_2x.gif) |
 | RL — collision | RL + Safety Filter — collision | CVaR-BF-QP — collision | **Ours — success** |
 
 
