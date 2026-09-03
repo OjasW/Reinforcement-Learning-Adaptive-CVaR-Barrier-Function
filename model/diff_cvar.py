@@ -5,6 +5,7 @@ import numpy as np
 from model.ppo_base import resolve_activation
 from model.qp_solver import solve_qp_cvxopt
 from model.traj_prediction import TrajPredictorTorch as TrajPredictor
+from model.gnn import GraphAttentionEncoder
 
 import math
 
@@ -35,7 +36,10 @@ class DiffCVaRBFQP(nn.Module):
                  qp_verbose=-1,
                  qp_max_iter=40,
                  robot_type='single_integrator', vmax=3.0, omega_max=3.0,
-                 gmm_weights=None, gmm_stds=None, gmm_lateral_ratio=0.3, **kwargs):
+                 gmm_weights=None, gmm_stds=None, gmm_lateral_ratio=0.3, 
+                 use_gnn=True, gnn_hidden_dim=64, gnn_embed_dim=128,
+                 gnn_layers=2, gnn_heads=4, gnn_dropout=0.0,
+                 **kwargs):
         super().__init__()
         self.n_features = n_features
         self.action_dim = action_dim
@@ -80,7 +84,21 @@ class DiffCVaRBFQP(nn.Module):
             stds=gmm_stds,
         )
 
-        self.fc1 = nn.Linear(n_features, hidden_dim)
+        #GNN Setup
+        self.use_gnn = bool(use_gnn)
+        if self.use_gnn:
+            assert (n_features - 6) % 6 == 0, f"unexpected obs_dim {n_features}"
+            max_humans = (n_features - 6) // 6
+            self.gnn_encoder = GraphAttentionEncoder(
+                max_humans=max_humans, node_in_dim=8, edge_in_dim=5,
+                hidden_dim=gnn_hidden_dim, embed_dim=gnn_embed_dim,
+                n_layers=gnn_layers, n_heads=gnn_heads, dropout=gnn_dropout,
+            )
+
+
+        #self.fc1 = nn.Linear(n_features, hidden_dim)
+        fc1_in_dim = gnn_embed_dim if self.use_gnn else n_features
+        self.fc1 = nn.Linear(fc1_in_dim, hidden_dim)
         self.fc21 = nn.Linear(hidden_dim, control_hidden_dim)
         self.fc22 = nn.Linear(hidden_dim, scalar_hidden_dim)
         self.fc23 = nn.Linear(hidden_dim, scalar_hidden_dim)
@@ -148,7 +166,9 @@ class DiffCVaRBFQP(nn.Module):
             obs = obs.unsqueeze(0)
         obs = obs.reshape(obs.size(0), -1)
 
-        x = self.act(self.fc1(obs))
+        # x = self.act(self.fc1(obs))
+        policy_feat = self.gnn_encoder(obs) if self.use_gnn else obs
+        x = self.act(self.fc1(policy_feat))
         x21 = self.act(self.fc21(x))
         x22 = self.act(self.fc22(x))
         x23 = self.act(self.fc23(x))
