@@ -134,6 +134,105 @@ def sample_point_in_disk(rng, center, radius, arena_size=None, max_tries=256):
         return center.copy()
     return np.clip(center, -arena_size, arena_size)
 
+def relative_obs_to_graph(obs):
+    """
+    Convert a relative-format observation to a graph representation.
+
+    Relative format:
+      [robot(6), human_1(6), ..., human_N(6)]
+
+    Returns:
+        robot:  (6,)
+        humans: (N, 6)
+
+    The final human feature is the validity mask. --->wdym?
+    """
+
+    arr = np.asarray(obs, dtype=np.float32)
+
+    if arr.ndim != 1:
+        raise ValueError(
+            f"Expected 1D relative observation, got shape {arr.shape}"
+        )
+
+    if arr.size < 6 or (arr.size - 6) % 6 != 0:
+        raise ValueError(
+            f"Invalid relative observation dimension: {arr.size}"
+        )
+
+    robot = arr[:6]
+    humans = arr[6:].reshape(-1, 6)
+
+    return robot, humans
+
+def relative_obs_to_graph(obs):
+    """
+    Convert relative flattened observation into robot/human graph tensors.
+
+    Relative observation:
+        [robot(6), human_1(6), ..., human_N(6)]
+
+    Returns:
+        robot:  (6,)
+        humans: (N, 6)
+
+    The final human feature is the validity mask.
+    """
+    arr = np.asarray(obs, dtype=np.float32)
+
+    if arr.ndim != 1:
+        raise ValueError(
+            f"Expected 1D relative observation, got shape {arr.shape}"
+        )
+
+    if arr.size < 6 or (arr.size - 6) % 6 != 0:
+        raise ValueError(
+            f"Invalid relative observation dimension: {arr.size}"
+        )
+
+    robot = arr[:6]
+    humans = arr[6:].reshape(-1, 6)
+
+    return robot, humans
+
+
+def relative_obs_batch_to_graph(obs_batch):
+    """
+    Convert batched relative observations into graph components.
+
+    Input:
+        (B, 6 + N*6)
+
+    Returns:
+        robot:
+            (B, 6)
+
+        humans:
+            (B, N, 6)
+    """
+    arr = np.asarray(obs_batch, dtype=np.float32)
+
+    if arr.ndim == 1:
+        robot, humans = relative_obs_to_graph(arr)
+        return robot[None, :], humans[None, :, :]
+
+    if arr.ndim != 2:
+        raise ValueError(
+            f"Expected 1D or 2D observation batch, got {arr.shape}"
+        )
+
+    n, d = arr.shape
+
+    if d < 6 or (d - 6) % 6 != 0:
+        raise ValueError(
+            f"Invalid relative observation width: {d}"
+        )
+
+    robot = arr[:, :6]
+    humans = arr[:, 6:].reshape(n, -1, 6)
+
+    return robot, humans
+
 
 def build_env(env_name: str, render_mode: str, config):
     from crowd_sim.env.social_nav import SocialNav
