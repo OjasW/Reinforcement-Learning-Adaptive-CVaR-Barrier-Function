@@ -169,6 +169,7 @@ class DiffCVaRBFQP(nn.Module):
         # x = self.act(self.fc1(obs))
         policy_feat = self.gnn_encoder(obs) if self.use_gnn else obs
         x = self.act(self.fc1(policy_feat))
+        assert not torch.isnan(policy_feat).any(), "NaN in GNN embedding"
         x21 = self.act(self.fc21(x))
         x22 = self.act(self.fc22(x))
         x23 = self.act(self.fc23(x))

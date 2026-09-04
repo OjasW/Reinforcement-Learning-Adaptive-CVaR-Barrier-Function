@@ -16,6 +16,11 @@ actor:
   gmm_weights: [0.6, 0.2, 0.2]
   gmm_stds: [0.1, 0.2, 0.2]
   gmm_lateral_ratio: 0.3
+  use_gnn: true
+  gnn_hidden_dim: 64
+  gnn_embed_dim: 128
+  gnn_layers: 2
+  gnn_heads: 4
 
 critic:
   hidden_dim: 256

@@ -46,6 +46,11 @@ def _actor_kwargs(cfg):
                 "act": actor_cfg.get("act", "relu"),
                 "beta_min": float(actor_cfg.get("beta_min", 0.05)),
                 "qp_max_iter": int(actor_cfg.get("qp_max_iter", 40)),
+                "use_gnn": bool(actor_cfg.get("use_gnn", True)),
+                "gnn_hidden_dim": int(actor_cfg.get("gnn_hidden_dim", 64)),
+                "gnn_embed_dim": int(actor_cfg.get("gnn_embed_dim", 128)),
+                "gnn_layers": int(actor_cfg.get("gnn_layers", 2)),
+                "gnn_heads": int(actor_cfg.get("gnn_heads", 4)),
             }
         )
 
