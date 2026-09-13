@@ -151,7 +151,7 @@ class PPO:
         start_time = time.time()
         while t_so_far < total_timesteps:                                                                       # ALG STEP 2
              
-            batch_obs, batch_acts, batch_log_probs, batch_rews, batch_lens, batch_vals, batch_dones = self.rollout()                     # ALG STEP 3
+            batch_obs, batch_gnn_obs, batch_acts, batch_log_probs, batch_rews, batch_lens, batch_vals, batch_dones = self.rollout()                     # ALG STEP 3
             batch_steps = int(np.sum(batch_lens))
             t_so_far += batch_steps
 
@@ -205,13 +205,14 @@ class PPO:
                     idx = inds[start:end]
                     # Extract data at the sampled indices
                     mini_obs = batch_obs[idx]
+                    mini_gnn_obs = batch_gnn_obs[idx]
                     mini_acts = batch_acts[idx]
                     mini_log_prob = batch_log_probs[idx]
                     mini_advantage = A_k[idx]
                     mini_rtgs = batch_rtgs[idx]
 
                     # Calculate V_phi and pi_theta(a_t | s_t) and entropy
-                    V, curr_log_probs, entropy, mini_mean = self.evaluate(mini_obs, mini_acts)
+                    V, curr_log_probs, entropy, mini_mean = self.evaluate(mini_obs, mini_acts, batch_gnn_obs=mini_gnn_obs)
 
                     # Calculate the policy ratio using log probabilities for numerical stability.
                     logratios = curr_log_probs - mini_log_prob
@@ -370,10 +371,12 @@ class PPO:
 
                 while not done:
                     with torch.no_grad():
-                        obs_rel = select_top_k_obs(absolute_obs_batch_to_relative(obs), self.obs_top_k)
+                        gnn_obs_full = absolute_obs_batch_to_relative(obs)
+                        obs_rel = select_top_k_obs(gnn_obs_full, self.obs_top_k)
                         obs_tensor = torch.tensor(obs_rel, dtype=torch.float).to(self.device).unsqueeze(0)
+                        gnn_obs_tensor = torch.tensor(gnn_obs_full, dtype=torch.float).to(self.device).unsqueeze(0)
                         if hasattr(self, 'actor'):
-                            policy_action = self.model.get_action_deterministic(obs_tensor)
+                            policy_action = self.model.get_action_deterministic(obs_tensor, gnn_obs=gnn_obs_tensor)
                             action_tensor = self.model.policy_action_to_env_action(obs_tensor, policy_action)
                             action = action_tensor.detach().cpu().numpy()[0]
                         else:
@@ -454,6 +457,7 @@ class PPO:
     def rollout(self):
        
         batch_obs = []
+        batch_gnn_obs = []
         batch_acts = []
         batch_log_probs = []
         batch_rews = []
@@ -486,12 +490,14 @@ class PPO:
                 t += 1 # Increment timesteps ran this batch so far
 
                 # Track observations in this batch
-                obs_rel = select_top_k_obs(absolute_obs_batch_to_relative(obs), self.obs_top_k)
+                gnn_obs_full = absolute_obs_batch_to_relative(obs)
+                obs_rel = select_top_k_obs(gnn_obs_full, self.obs_top_k)
                 batch_obs.append(obs_rel)
+                batch_gnn_obs.append(gnn_obs_full)
 
                 # Calculate action and make a step in the env. 
                 # Note that rew is short for reward.
-                action, log_prob = self.get_action(obs)
+                action, log_prob = self.get_action(obs_rel, gnn_obs=gnn_obs_full)
                 if self.render and len(batch_lens) == 0:
                     _set_render_safe_distance(self.env, self.actor)
                     self.env.render()
@@ -524,6 +530,7 @@ class PPO:
             batch_dones.append(ep_dones)
         # Reshape data as tensors in the shape specified in function description, before returning
         batch_obs = torch.tensor(batch_obs, dtype=torch.float).to(self.device)
+        batch_gnn_obs = torch.tensor(batch_gnn_obs, dtype=torch.float).to(self.device)
         batch_acts = torch.tensor(batch_acts, dtype=torch.float).to(self.device)
         batch_log_probs = torch.tensor(batch_log_probs, dtype=torch.float).flatten().to(self.device)
 
@@ -535,23 +542,23 @@ class PPO:
         self.logger['n_collision'] = n_collision
 
         # Here, we return the batch_rews instead of batch_rtgs for later calculation of GAE
-        return batch_obs, batch_acts, batch_log_probs, batch_rews, batch_lens, batch_vals, batch_dones
+        return batch_obs, batch_gnn_obs, batch_acts, batch_log_probs, batch_rews, batch_lens, batch_vals, batch_dones
 
-    def get_action(self, obs):
+    def get_action(self, obs, gnn_obs=None):
         """
             Queries an action from the actor network, should be called from rollout.
 
             Parameters:
-                obs - the observation at the current timestep
-
-            Return:
-                action - the action to take, as a numpy array
-                log_prob - the log probability of the selected action in the distribution
+                obs - the observation at the current timestep, ALREADY converted
+                      to relative format and top-k-selected by the caller.
+                gnn_obs - optional wide (all-obstacle) relative-format observation
+                      for the GNN. If None, falls back to `obs`.
         """
-        # Query the actor network for a mean action
-        obs_rel = select_top_k_obs(absolute_obs_batch_to_relative(obs), self.obs_top_k)
-        obs = torch.tensor(obs_rel, dtype=torch.float).to(self.device)
-        mean = self.actor(obs)  # latent mean (unbounded)
+        obs = torch.tensor(obs, dtype=torch.float).to(self.device) if not torch.is_tensor(obs) else obs
+        gnn_obs_t = None
+        if gnn_obs is not None:
+            gnn_obs_t = torch.tensor(gnn_obs, dtype=torch.float).to(self.device) if not torch.is_tensor(gnn_obs) else gnn_obs
+        mean = self.actor(obs, gnn_obs=gnn_obs_t)  # latent mean (unbounded)
         dist = self._build_action_dist(mean)
 
         # Sample latent action then squash/mapping to real action bounds
@@ -571,7 +578,7 @@ class PPO:
         # Return the sampled action and the log probability of that action in our distribution
         return action.detach().cpu().numpy(), log_prob.detach().cpu().numpy()
 
-    def evaluate(self, batch_obs, batch_acts):
+    def evaluate(self, batch_obs, batch_acts, batch_gnn_obs=None):
         """
             Estimate the values of each observation, and the log probs of
             each action in the most recent batch with the most recent
@@ -586,13 +593,10 @@ class PPO:
                                 batch as a tensor. Shape: (number of timesteps in batch)
         """
         # Query critic network for a value V for each batch_obs. Shape of V should be same as batch_rtgs
-        # if batch_obs.size(0) == 1:
-        #     V = self.critic(batch_obs)
-        # else:
-        V = self.critic(batch_obs).squeeze()
+        V = self.critic(batch_obs).squeeze(-1)
 
         # Calculate log probabilities with squashed Gaussian change-of-variables correction.
-        mean = self.actor(batch_obs)  # latent mean
+        mean = self.actor(batch_obs, gnn_obs=batch_gnn_obs)  # latent mean
         dist = self._build_action_dist(mean)
         z, u = self._unsquash_action(batch_acts)
         base_log_probs = dist.log_prob(z)

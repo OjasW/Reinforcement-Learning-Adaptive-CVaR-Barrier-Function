@@ -31,15 +31,15 @@ class ActorCritic(nn.Module):
         self.register_buffer("act_scale", 0.5 * (action_high - action_low))
         self.register_buffer("act_bias", 0.5 * (action_high + action_low))
 
-    def forward(self, obs):
-        return self.actor(obs)
+    def forward(self, obs, gnn_obs=None):
+        return self.actor(obs, gnn_obs=gnn_obs)
 
     def build_action_dist(self, mean):
         std = torch.exp(self.log_std).clamp_min(1e-6)
         return Independent(Normal(mean, std), 1)
 
-    def get_action_deterministic(self, obs):
-        return self.actor(obs)
+    def get_action_deterministic(self, obs, gnn_obs=None):
+        return self.actor(obs, gnn_obs=gnn_obs)
 
     def policy_action_to_env_action(self, obs, policy_action, return_squashed=False):
         squashed = torch.tanh(policy_action)

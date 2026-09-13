@@ -6,6 +6,8 @@ from model.ppo_base import resolve_activation
 from model.qp_solver import solve_qp_cvxopt
 from model.traj_prediction import TrajPredictorTorch as TrajPredictor
 from model.gnn import GraphAttentionEncoder
+from model.graph import create_graph, visualize_graph
+from model.gat import GATModel
 
 import math
 
@@ -38,7 +40,7 @@ class DiffCVaRBFQP(nn.Module):
                  robot_type='single_integrator', vmax=3.0, omega_max=3.0,
                  gmm_weights=None, gmm_stds=None, gmm_lateral_ratio=0.3, 
                  use_gnn=True, gnn_hidden_dim=64, gnn_embed_dim=128,
-                 gnn_layers=2, gnn_heads=4, gnn_dropout=0.0,
+                 gnn_layers=2, gnn_heads=4, gnn_dropout=0.0, gnn_max_humans=None,
                  **kwargs):
         super().__init__()
         self.n_features = n_features
@@ -87,12 +89,19 @@ class DiffCVaRBFQP(nn.Module):
         #GNN Setup
         self.use_gnn = bool(use_gnn)
         if self.use_gnn:
-            assert (n_features - 6) % 6 == 0, f"unexpected obs_dim {n_features}"
-            max_humans = (n_features - 6) // 6
-            self.gnn_encoder = GraphAttentionEncoder(
-                max_humans=max_humans, node_in_dim=8, edge_in_dim=5,
-                hidden_dim=gnn_hidden_dim, embed_dim=gnn_embed_dim,
-                n_layers=gnn_layers, n_heads=gnn_heads, dropout=gnn_dropout,
+            self.max_humans = (gnn_max_humans if gnn_max_humans is not None else 20)
+            # self.gnn_encoder = GraphAttentionEncoder(
+            #     max_humans=max_humans, node_in_dim=8, edge_in_dim=5,
+            #     hidden_dim=gnn_hidden_dim, embed_dim=gnn_embed_dim,
+            #     n_layers=gnn_layers, n_heads=gnn_heads, dropout=gnn_dropout,
+            # )
+            self.gnn_encoder = GATModel(
+                max_humans=self.max_humans,
+                input_dim=8,
+                edge_dim=5,
+                hidden_dim=128,      # whatever dimensions you chose
+                output_dim=gnn_embed_dim,
+                num_layers=2
             )
 
 
@@ -158,7 +167,11 @@ class DiffCVaRBFQP(nn.Module):
         variances = variances_flat.reshape(bsz, k, m)
         return means, variances
 
-    def forward(self, obs):
+    def forward(self, obs, gnn_obs=None):
+        # print("DIFF CVAR obs:", type(obs))
+        # print("DIFF CVAR obs:", obs)
+        # print("fc1:", type(self.fc1))
+        # print("fc1.weight:", type(self.fc1.weight))
         if isinstance(obs, np.ndarray):
             obs = torch.tensor(obs, dtype=torch.float)
         obs = obs.to(self.fc1.weight.device)
@@ -167,9 +180,13 @@ class DiffCVaRBFQP(nn.Module):
         obs = obs.reshape(obs.size(0), -1)
 
         # x = self.act(self.fc1(obs))
-        policy_feat = self.gnn_encoder(obs) if self.use_gnn else obs
-        x = self.act(self.fc1(policy_feat))
-        assert not torch.isnan(policy_feat).any(), "NaN in GNN embedding"
+        if self.use_gnn:
+            graph_data = create_graph(gnn_obs, self.max_humans)
+            gnn = self.gnn_encoder(graph_data)
+            
+
+        x = self.act(self.fc1(gnn))
+        assert not torch.isnan(gnn).any(), "NaN in GNN embedding"
         x21 = self.act(self.fc21(x))
         x22 = self.act(self.fc22(x))
         x23 = self.act(self.fc23(x))

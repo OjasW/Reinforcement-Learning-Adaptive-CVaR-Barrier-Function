@@ -51,6 +51,16 @@ def _actor_kwargs(cfg):
                 "gnn_embed_dim": int(actor_cfg.get("gnn_embed_dim", 128)),
                 "gnn_layers": int(actor_cfg.get("gnn_layers", 2)),
                 "gnn_heads": int(actor_cfg.get("gnn_heads", 4)),
+                "qp_top_k": (
+                    int(actor_cfg["qp_top_k"])
+                    if actor_cfg.get("qp_top_k", None) is not None
+                    else None
+                ),
+                "gnn_max_humans": (
+                    int(actor_cfg["gnn_max_humans"])
+                    if actor_cfg.get("gnn_max_humans", None) is not None
+                    else None
+                ),
             }
         )
 

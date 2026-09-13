@@ -13,6 +13,7 @@ class VecPPO(PPO):
             Rollout logic for Vectorized Environments.
         """
         batch_obs = []
+        batch_gnn_obs = []
         batch_acts = []
         batch_log_probs = []
         batch_rews = []
@@ -22,6 +23,7 @@ class VecPPO(PPO):
 
         # Buffers for each environment
         env_obs = [[] for _ in range(self.num_envs)]
+        env_gnn_obs = [[] for _ in range(self.num_envs)]
         env_acts = [[] for _ in range(self.num_envs)]
         env_log_probs = [[] for _ in range(self.num_envs)]
         env_rews = [[] for _ in range(self.num_envs)]
@@ -33,8 +35,8 @@ class VecPPO(PPO):
 
         # Reset all environments
         obs, _ = self.env.reset()
-        obs = absolute_obs_batch_to_relative(obs)
-        obs = select_top_k_obs(obs, self.obs_top_k)
+        gnn_obs = absolute_obs_batch_to_relative(obs)   # wide, all obstacles -- captured BEFORE truncation
+        obs = select_top_k_obs(gnn_obs, self.obs_top_k)  # narrow, top-k -- for the QP, unchanged
 
         t_so_far = 0
         
@@ -42,18 +44,19 @@ class VecPPO(PPO):
         while t_so_far < self.timesteps_per_batch:
             # Get actions for all envs
             # obs is (num_envs, obs_dim) which works with FeedForwardNN
-            actions, log_probs = self.get_action(obs)
+            actions, log_probs = self.get_action(obs, gnn_obs=gnn_obs)
             
             # Step the vectorized environment
             next_obs, rews, terminations, truncations, infos = self.env.step(actions)
-            next_obs = absolute_obs_batch_to_relative(next_obs)
-            next_obs = select_top_k_obs(next_obs, self.obs_top_k)
+            next_gnn_obs = absolute_obs_batch_to_relative(next_obs)
+            next_obs = select_top_k_obs(next_gnn_obs, self.obs_top_k)
             
             dones = terminations | truncations
 
             for i in range(self.num_envs):
                 # Store step data
                 env_obs[i].append(obs[i])
+                env_gnn_obs[i].append(gnn_obs[i])
                 env_acts[i].append(actions[i])
                 env_log_probs[i].append(log_probs[i])
                 env_rews[i].append(rews[i])
@@ -76,6 +79,7 @@ class VecPPO(PPO):
                     
                     # Store episode data to batch
                     batch_obs.extend(env_obs[i])
+                    batch_gnn_obs.extend(env_gnn_obs[i])
                     batch_acts.extend(env_acts[i])
                     batch_log_probs.extend(env_log_probs[i])
                     batch_rews.append(ep_rews)
@@ -96,6 +100,7 @@ class VecPPO(PPO):
                     
                     # Reset buffers for env i
                     env_obs[i] = []
+                    env_gnn_obs[i] = []
                     env_acts[i] = []
                     env_log_probs[i] = []
                     env_rews[i] = []
@@ -103,9 +108,11 @@ class VecPPO(PPO):
             
             # Update obs
             obs = next_obs
+            gnn_obs = next_gnn_obs
 
         # Convert to tensors
         batch_obs = torch.tensor(np.array(batch_obs), dtype=torch.float).to(self.device)
+        batch_gnn_obs = torch.tensor(np.array(batch_gnn_obs), dtype=torch.float).to(self.device)
         batch_acts = torch.tensor(np.array(batch_acts), dtype=torch.float).to(self.device)
         batch_log_probs = torch.tensor(np.array(batch_log_probs), dtype=torch.float).to(self.device)
         
@@ -116,4 +123,4 @@ class VecPPO(PPO):
         self.logger['n_success'] = n_success
         self.logger['n_collision'] = n_collision
 
-        return batch_obs, batch_acts, batch_log_probs, batch_rews, batch_lens, batch_vals, batch_dones
+        return batch_obs, batch_gnn_obs, batch_acts, batch_log_probs, batch_rews, batch_lens, batch_vals, batch_dones

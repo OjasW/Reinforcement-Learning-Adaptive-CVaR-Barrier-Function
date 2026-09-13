@@ -192,10 +192,12 @@ class Evaluator:
                     frames = [] if self.visualize else None
 
                     while not done:
-                        policy_obs = policy_obs_from_env_obs(obs, self.obs_top_k)
+                        gnn_obs_full = absolute_obs_to_relative(obs)
+                        policy_obs = select_top_k_obs(gnn_obs_full, self.obs_top_k)
                         obs_t = torch.tensor(policy_obs, dtype=torch.float32, device=self.device).unsqueeze(0)
+                        gnn_obs_t = torch.tensor(gnn_obs_full, dtype=torch.float32, device=self.device).unsqueeze(0)
                         with torch.no_grad():
-                            policy_action = self.model.get_action_deterministic(obs_t)
+                            policy_action = self.model.get_action_deterministic(obs_t, gnn_obs=gnn_obs_t)
                             set_render_safe_distance(env, self.model.actor)
                             action = self.model.policy_action_to_env_action(obs_t, policy_action)
                             action = action.detach().cpu().numpy().astype(np.float32).squeeze(0)

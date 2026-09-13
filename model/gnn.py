@@ -8,6 +8,7 @@ def build_graph_from_rel_obs(obs: torch.Tensor, max_humans: int):
     """
     obs: (B, 6 + max_humans * 6) relative-format observation, as produced
          by absolute_obs_to_relative / absolute_obs_batch_to_relative.
+         
 
     Returns
     -------
@@ -151,7 +152,7 @@ class DenseGATLayer(nn.Module):
 
         # Project edges
         edge_attn = self.lin_edge_attn(edge_feats).view(B, N, N, H, D)
-        edge_msg = self.lin_edge_msg(edge_feats).view(B, N, N, H, D)
+        edge_msg = self.lin_edge_msg(edge_feats).view(B, N, N, H, D) #unnecessary
 
         #m = dst.unsqueeze(1) + edge                                   # (B, N_i, N_j, H, D)
         pair = (src.unsqueeze(2) + dst.unsqueeze(1) + edge_attn)
