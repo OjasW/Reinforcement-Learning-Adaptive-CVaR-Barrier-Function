@@ -44,7 +44,7 @@ class GATModel(BaseGNN):
         self.psi3 = nn.Sequential(nn.Linear(128, 256), nn.ReLU(), nn.Linear(256, 128))
 
         # MLP psi4: Outputs final scalar
-        self.psi4 = nn.Sequential(nn.Linear(128, 256), nn.ReLU(), nn.Linear(256, output_dim))
+        self.psi4 = nn.Sequential(nn.Linear(128, 256), nn.ReLU(), nn.Linear(256, self.output_dim))
 
     def forward(self, data):
         """
@@ -96,7 +96,7 @@ class GATModel(BaseGNN):
         q_i.index_add_(0, src, weighted_messages)
 
         # Step 5: Final regression via psi4
-        num_graphs = int(data.batch.max().item()) + 1 if data.batch.numel() > 0 else 0
+        num_graphs = int(batch.max().item()) + 1
         nodes_per_graph = self.max_humans + 2
 
         robot_indices = torch.arange(0, num_graphs * nodes_per_graph, nodes_per_graph, device=batch.device)
@@ -105,4 +105,4 @@ class GATModel(BaseGNN):
         # Step 6: Pass the robot's feature vector through psi4
         output = self.psi4(robot_q)
 
-        return output
+        return output.squeeze(-1)

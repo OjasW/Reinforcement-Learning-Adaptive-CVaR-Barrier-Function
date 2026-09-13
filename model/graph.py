@@ -37,23 +37,26 @@ def create_graph(obstacles: torch.Tensor, max_humans: int) -> Dict:
 
     # Nodes are robot, goal and obstacles. Features are relative positions, velocities, radius, and validity mask.
 
-    # Position
-    goal_rel_pos = torch.tensor(obstacles[:, :2], dtype=torch.float32)  # (B, 2)
-    obs_rel_pos = torch.tensor(obstacles[:, 6:6 + max_humans * 2], dtype=torch.float32).reshape(B, max_humans, 2)  # (B, max_humans, 2)
+    # Position (obstacle-major layout: each obstacle occupies a contiguous
+    # 6-value block [rel_x, rel_y, vx, vy, radius, mask], NOT grouped by field)
+    goal_rel_pos = obstacles[:, :2]  # (B, 2)
+
+    blocks = obstacles[:, 6:].reshape(B, max_humans, 6)  # (B, max_humans, 6)
+    obs_rel_pos = blocks[:, :, 0:2]   # (B, max_humans, 2)
 
     # Velocity
-    robot_vel = torch.tensor(obstacles[:, 2:4], dtype=torch.float32)  # (B, 2)
-    obs_vel = torch.tensor(obstacles[:, 6 + max_humans * 2:6 + max_humans * 4], dtype=torch.float32).reshape(B, max_humans, 2)  # (B, max_humans, 2)
+    robot_vel = obstacles[:, 2:4]  # (B, 2)
+    obs_vel = blocks[:, :, 2:4]       # (B, max_humans, 2)
 
     # Radius
-    robot_radius = torch.tensor(obstacles[:, 4:5], dtype=torch.float32)  # (B, 1)
-    obs_radius = torch.tensor(obstacles[:, 6 + max_humans * 4:6 + max_humans * 5], dtype=torch.float32).reshape(B, max_humans, 1)  # (B, max_humans, 1)
+    robot_radius = obstacles[:, 5:6]   # (B, 1)
+    obs_radius = blocks[:, :, 4:5]    # (B, max_humans, 1)
 
     # Heading angle
-    robot_heading = torch.tensor(obstacles[:, 5:6], dtype=torch.float32)  # (B, 1)
+    robot_heading = obstacles[:, 4:5]  # (B, 1)
 
     # Obstacle mask
-    obs_mask = torch.tensor(obstacles[:, 6 + max_humans * 5:6 + max_humans * 6], dtype=torch.float32).reshape(B, max_humans, 1)  # (B, max_humans, 1)   
+    obs_mask = blocks[:, :, 5:6]      # (B, max_humans, 1)
 
     # Node features = [relative position x, relative position y, velocity x, velocity y, radius, cos(heading angle), sin(heading angle), validity mask]
     robot_node = torch.stack([

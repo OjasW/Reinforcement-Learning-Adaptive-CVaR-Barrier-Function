@@ -40,7 +40,7 @@ class DiffCVaRBFQP(nn.Module):
                  robot_type='single_integrator', vmax=3.0, omega_max=3.0,
                  gmm_weights=None, gmm_stds=None, gmm_lateral_ratio=0.3, 
                  use_gnn=True, gnn_hidden_dim=64, gnn_embed_dim=128,
-                 gnn_layers=2, gnn_heads=4, gnn_dropout=0.0, gnn_max_humans=None,
+                 gnn_layers=2, gnn_heads=4, gnn_dropout=0.0, gnn_max_humans=20,
                  **kwargs):
         super().__init__()
         self.n_features = n_features
