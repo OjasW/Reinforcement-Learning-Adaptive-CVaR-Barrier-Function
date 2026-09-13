@@ -1,8 +1,8 @@
 defaults:
   - base
-  - env: social_nav_var_num
-  - robot: single_integrator
-  - model: ppo_base
+  - robot: unicycle
+  - env: crowd_dyn_var_num_env
+  - model: diff_cvar_mlp
   - trainer: ppo
   - _self_
 

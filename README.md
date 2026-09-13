@@ -2,7 +2,7 @@
 
 Crowd navigation scneario
 
-High-density out-of-distribution comparison (2× speed). 
+High-density out-of-distribution comparison (2× speed), from the original release on `main`.
 
 
 | RL             | RL+SF                          | CVaR-BF-QP             | Ours               |
@@ -13,52 +13,56 @@ High-density out-of-distribution comparison (2× speed).
 
 ## Install
 
-Clone the repository and create the environment:
+Clone the `main_jax` branch and create the environment. 
 
 ```bash
-git clone https://github.com/anonymousrobotics9666/Reinforcement-Learning-Adaptive-CVaR-Barrier-Function.git
+git clone --branch main_jax https://github.com/anonymousrobotics9666/Reinforcement-Learning-Adaptive-CVaR-Barrier-Function.git
 cd Reinforcement-Learning-Adaptive-CVaR-Barrier-Function
 conda env create -f environment.yml
-conda activate diff_cvar
+conda activate diff_cvar_jax
 ```
 
-For a CUDA build, install the matching PyTorch wheel for your machine after activating the environment. 
-
-## Quick Start
-
-Run a short environment rollout to verify the install and save a GIF:
+Install the appropriate [JAX build](https://docs.jax.dev/en/latest/installation.html) after activating the environment, then install Optax:
 
 ```bash
-python scripts/test_env.py --episodes 3
+# CPU
+python -m pip install --upgrade jax
+# NVIDIA CUDA 12: use this instead of the CPU command
+# python -m pip install --upgrade "jax[cuda12]"
+python -m pip install "optax==0.2.8"
 ```
 
-Expected ending:
+JAX and Optax are intentionally not included in `environment.yml`.
 
-```text
-env test passed: outputs/social_nav_var_num/env_test/<run>/summary.json
+<!-- ## Quick Start -->
+
+<!-- Verify the installation and available devices:
+
+```bash
+python -c "import jax, optax; print(jax.devices()); print(optax.__version__)" -->
 ```
 
 ## Train
 
-Default DiffCVaR-CBF-QP training:
+Default DiffCVaR-MLP-CBF-QP training:
 
 ```bash
-bash scripts/run_ppo.sh
+RUN_NAME=diff_cvar_mlp bash scripts/run_ppo.sh
 ```
 
-Train the vanilla PPO baseline:
+Train the PPO-MLP baseline:
 
 ```bash
-MODEL=ppo_base RUN_NAME=ppo_base bash scripts/run_ppo.sh
+RUN_NAME=ppo_mlp bash scripts/run_ppo.sh model=ppo_mlp
 ```
 
 Outputs are saved under:
 
 ```text
-outputs/social_nav_var_num/runs/<run_name>-<model>-bs<batch>-ep<epochs>-lr<lr>/
+outputs/crowd_dyn_var_num_env/runs/<run>/
 ```
 
-Each run contains `config.yaml`, `ckpt_<step>.pt`, and `ckpt_manifest.json`.
+Each run contains `config.yaml`; training evaluation saves `ckpt_<step>.pkl` and `ckpt_manifest.json`. Old PyTorch `.pt` checkpoints are not compatible with this JAX branch.
 
 ## Common Overrides
 
@@ -67,16 +71,16 @@ Common options can be changed from the shell launcher:
 
 | Option           | Values / example                              |
 | ---------------- | --------------------------------------------- |
-| Model            | `MODEL=diff_cvar` or `MODEL=ppo_base`         |
-| Environment      | `env=social_nav_var_num` or `env=social_nav`  |
-| Robot            | `ROBOT=single_integrator` or `ROBOT=unicycle` |
+| Model            | `model=diff_cvar_mlp` or `model=ppo_mlp`      |
+| Environment      | `env=crowd_dyn_var_num_env`                  |
+| Robot            | `robot=single_integrator` or `robot=unicycle` |
 | Number of humans | `env.humans.num_humans=15`                    |
 
 
 Example:
 
 ```bash
-MODEL=diff_cvar ROBOT=single_integrator RUN_NAME=demo bash scripts/run_ppo.sh \
+RUN_NAME=demo bash scripts/run_ppo.sh model=diff_cvar_mlp robot=single_integrator \
   env.humans.num_humans=15
 ```
 
@@ -87,14 +91,14 @@ For all other parameters, see the YAML files under `config/`.
 For offline logging:
 
 ```bash
-WANDB_MODE=offline bash scripts/run_ppo.sh
+WANDB_MODE=offline RUN_NAME=offline_run bash scripts/run_ppo.sh
 ```
 
 For online logging:  
 
 ```bash
 wandb login
-WANDB_PROJECT=<project_name> WANDB_ENTITY=<user_or_team> bash scripts/run_ppo.sh
+RUN_NAME=online_run WANDB_PROJECT=<project_name> WANDB_ENTITY=<user_or_team> bash scripts/run_ppo.sh
 ```
 
 ## Evaluate
@@ -102,36 +106,37 @@ WANDB_PROJECT=<project_name> WANDB_ENTITY=<user_or_team> bash scripts/run_ppo.sh
 List checkpoints:
 
 ```bash
-ls outputs/social_nav_var_num/runs
-ls outputs/social_nav_var_num/runs/<run>/ckpt_*.pt
+ls outputs/crowd_dyn_var_num_env/runs
+ls outputs/crowd_dyn_var_num_env/runs/<run>/ckpt_*.pkl
 ```
 
 Evaluate one checkpoint:
 
 ```bash
 python scripts/eval.py \
-  --save-dir outputs/social_nav_var_num/runs/<run> \
-  --checkpoint outputs/social_nav_var_num/runs/<run>/ckpt_<step>.pt
+  --save-dir outputs/crowd_dyn_var_num_env/runs/<run> \
+  --checkpoint outputs/crowd_dyn_var_num_env/runs/<run>/ckpt_<step>.pkl
 ```
 
-Save rollout GIFs:
+Save rollout MP4s:
 
 ```bash
 python scripts/eval.py \
-  --save-dir outputs/social_nav_var_num/runs/<run> \
-  --checkpoint outputs/social_nav_var_num/runs/<run>/ckpt_<step>.pt \
+  --save-dir outputs/crowd_dyn_var_num_env/runs/<run> \
+  --checkpoint outputs/crowd_dyn_var_num_env/runs/<run>/ckpt_<step>.pkl \
   --visualize \
-  env.humans.num_humans=10
+  --seeds 100,200 --episodes 1
 ```
 
 ## Repository Layout
 
 ```text
 config/      Hydra configs
-crowd_sim/   Gymnasium crowd navigation environments
-model/       PPO and DiffCVaR-CBF-QP models
-trainer/     PPO training loop and checkpointing
-scripts/     Train, eval, and environment test entrypoints
+env/         JAX crowd navigation environments
+model/       PPO-MLP and DiffCVaR-MLP-CBF-QP models
+solver/      Differentiable JAX QP solver
+trainer/     JAX PPO training loop and checkpointing
+scripts/     Training and evaluation entrypoints
 ```
 
 ## Acknowledgments

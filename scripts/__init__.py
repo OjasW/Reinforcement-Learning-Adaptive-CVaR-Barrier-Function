@@ -1,2 +1,1 @@
-"""Runnable training scripts."""
-
+"""Command-line launchers."""
