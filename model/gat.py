@@ -59,6 +59,8 @@ class GATModel(BaseGNN):
 
         node_features, edge_index, edge_attr, batch = data.x, data.edge_index, data.edge_attr, data.batch
 
+        node_valid = node_features[:, -1]
+
         # Step 1: Create z_ij = [v_i, v_j, e_ij] for each edge
         src, dest = edge_index
         v_i = node_features[src]
@@ -70,6 +72,8 @@ class GATModel(BaseGNN):
 
         # Step 3: Node wise softmax
         raw_weights = self.psi2(q_ij).squeeze(-1)
+        dest_valid = node_valid[dest] > 0.5
+        raw_weights = raw_weights.masked_fill(~dest_valid, float("-inf"))
 
         # scatter_softmax alternative
         max_weights = torch.full((raw_weights.size(0),), float("-inf"), device=raw_weights.device)
