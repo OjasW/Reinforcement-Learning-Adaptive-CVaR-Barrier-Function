@@ -97,8 +97,8 @@ class DiffCVaRBFQP(nn.Module):
             # )
             self.gnn_encoder = GATModel(
                 max_humans=self.max_humans,
-                input_dim=8,
-                edge_dim=5,
+                input_dim=4,
+                edge_dim=7,
                 hidden_dim=128,      # whatever dimensions you chose
                 output_dim=gnn_embed_dim,
                 num_layers=2
