@@ -11,6 +11,8 @@ actor:
   safety_margin: 0.05
   alpha: 2.0
   beta_min: 0.05
+  beta_budget: 0.5
+  obs_top_k: ${env.obs_top_k}
   beta: 0.5
   qp_max_iter: 40
   gmm_weights: [0.6, 0.2, 0.2]

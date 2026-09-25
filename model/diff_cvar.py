@@ -34,7 +34,9 @@ class DiffCVaRBFQP(nn.Module):
                  safe_dist=0.8, 
                  alpha=2.0, 
                  beta_min=0.05,
+                 beta_budget=0.5,
                  beta=0.1,
+                 obs_top_k=1,
                  qp_verbose=-1,
                  qp_max_iter=40,
                  robot_type='single_integrator', vmax=3.0, omega_max=3.0,
@@ -46,9 +48,12 @@ class DiffCVaRBFQP(nn.Module):
         self.n_features = n_features
         self.action_dim = action_dim
 
+        self.obs_top_k = obs_top_k
+
         self.safe_dist = safe_dist
         self.alpha = alpha   
         self.beta_min = float(beta_min)
+        self.beta_budget = float(beta_budget)
         self.beta = float(beta)
         if not (0.0 < self.beta_min < self.beta < 1.0):
             raise ValueError("DiffCVaRBFQP requires 0.0 < beta_min < beta < 1.0")
@@ -112,7 +117,7 @@ class DiffCVaRBFQP(nn.Module):
         self.fc22 = nn.Linear(hidden_dim, scalar_hidden_dim)
         self.fc23 = nn.Linear(hidden_dim, scalar_hidden_dim)
         self.fc31 = nn.Linear(control_hidden_dim, action_dim)
-        self.fc32 = nn.Linear(scalar_hidden_dim, 1)
+        self.fc32 = nn.Linear(scalar_hidden_dim, self.obs_top_k)
         self.fc33 = nn.Linear(scalar_hidden_dim, 1)
 
     def _solve_qpth(self, Q, p, G, h, e):
@@ -192,9 +197,15 @@ class DiffCVaRBFQP(nn.Module):
         x23 = self.act(self.fc23(x))
 
         u_nom = self.fc31(x21)
-        beta_raw = torch.sigmoid(self.fc32(x22)).squeeze(-1)
-        beta = self.beta_min + (self.beta - self.beta_min) * beta_raw
-        self.last_beta = beta
+        ## Mutltiple beta case
+        beta_logits = self.fc32(x22)
+        beta_weights = torch.softmax(beta_logits, dim=-1) # Sum = 1
+        assert self.beta_budget > self.obs_top_k * self.beta_min, (
+            f"beta_budget ({self.beta_budget}) must be > K * beta_min ({self.obs_top_k * self.beta_min})"
+        ) # Make sure budget is not crossed by sum of minimium values
+        beta_slack = self.beta_budget - (self.obs_top_k * self.beta_min)
+        beta = self.beta_min + beta_weights * beta_slack # (B, K)
+        self.last_beta = beta.detach()
 
         r_scale = 1.0 + 1.5*torch.sigmoid(self.fc33(x23)).squeeze(-1) # (B,) in [0, 2]
         r_safe_learned = self.safe_dist * r_scale
@@ -240,7 +251,7 @@ class DiffCVaRBFQP(nn.Module):
         h = dist_sq - r_safe_learned.unsqueeze(1)**2
         # barrier h(x) = ||rel||^2 - R^2
 
-        cvar_coeff = cvar_coeff_from_beta(beta).unsqueeze(1).unsqueeze(2)  # (B,1,1)
+        cvar_coeff = cvar_coeff_from_beta(beta).unsqueeze(-1)  # (B,K,1) -->Change form (B, 1, 1)
         
         means, variances = self._predict_gmm_multi(human_vel)  # (B,K,M,2), (B,K,M)
 
@@ -342,7 +353,7 @@ class DiffCVaRBFQP(nn.Module):
         lg_w = 2 * epsilon * (p_L[:, :, 1] * c.unsqueeze(1) - p_L[:, :, 0] * s.unsqueeze(1))
 
         # CVaR term from GMM prediction of human velocity
-        cvar_coeff = cvar_coeff_from_beta(beta).unsqueeze(1).unsqueeze(2)  # (B,1,1)
+        cvar_coeff = cvar_coeff_from_beta(beta).unsqueeze(-1)  # (B,K,1)  --> Change from (B, 1, 1)
         means, variances = self._predict_gmm_multi(human_vel)  # (B,K,M,2), (B,K,M)
 
         pL_norm_sq = (p_L ** 2).sum(dim=2, keepdim=True)  # (B,K,1)

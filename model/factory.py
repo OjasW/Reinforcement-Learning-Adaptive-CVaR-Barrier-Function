@@ -45,17 +45,14 @@ def _actor_kwargs(cfg):
                 "scalar_hidden_dim": int(actor_cfg.get("scalar_hidden_dim", 256)),
                 "act": actor_cfg.get("act", "relu"),
                 "beta_min": float(actor_cfg.get("beta_min", 0.05)),
+                "beta_budget": float(actor_cfg.get("beta_budget", 0.5)),
+                "obs_top_k": int(actor_cfg.get("obs_top_k", 1)),
                 "qp_max_iter": int(actor_cfg.get("qp_max_iter", 40)),
                 "use_gnn": bool(actor_cfg.get("use_gnn", True)),
                 "gnn_hidden_dim": int(actor_cfg.get("gnn_hidden_dim", 64)),
                 "gnn_embed_dim": int(actor_cfg.get("gnn_embed_dim", 128)),
                 "gnn_layers": int(actor_cfg.get("gnn_layers", 2)),
                 "gnn_heads": int(actor_cfg.get("gnn_heads", 4)),
-                "qp_top_k": (
-                    int(actor_cfg["qp_top_k"])
-                    if actor_cfg.get("qp_top_k", None) is not None
-                    else None
-                ),
                 "gnn_max_humans": (
                     int(actor_cfg["gnn_max_humans"])
                     if actor_cfg.get("gnn_max_humans", None) is not None
