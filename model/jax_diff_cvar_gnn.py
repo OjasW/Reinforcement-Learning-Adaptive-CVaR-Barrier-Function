@@ -74,7 +74,7 @@ def hparams_from_config(model_cfg, critic_cfg, act_dim=2):
     obs_frame_dim = int(model_cfg.obs_frame_dim)
     obs_dim = int(model_cfg.obs_dim)
     if history_len <= 0:
-        raise ValueError("diff_cvar_mlp requires history_len > 0")
+        raise ValueError("diff_cvar_gnn requires history_len > 0")
     if obs_frame_dim < 6 or (obs_frame_dim - 6) % 6 != 0:
         raise ValueError(
             "diff_cvar_gnn requires obs_frame_dim = 6 + num_humans * 6"

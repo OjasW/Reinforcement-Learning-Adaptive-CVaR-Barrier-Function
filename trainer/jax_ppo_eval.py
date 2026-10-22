@@ -12,6 +12,7 @@ from env.jax_social_nav import (
     reset_env_with_keys,
     step_env,
 )
+from env.jax_image_renderer import init_image_history, render_policy_frame  # [IMG]
 
 
 DEFAULT_EVAL_SEEDS = tuple(range(100, 1001, 100))
@@ -94,8 +95,11 @@ def _evaluate_seed_values(
     seed_values,
     policy_action_mean_fn=None,
     policy_action_to_env_action_fn=None,
+    render_cfg=None,  # [IMG] None -> no images (MLP/GNN)
+    image_history_len=4,  # [IMG]
 ):
     """Evaluate all requested episodes as one batched JAX env rollout."""
+    use_images = render_cfg is not None  # [IMG] static
     if policy_action_mean_fn is None or policy_action_to_env_action_fn is None:
         raise ValueError("policy functions must be provided by the selected model")
 
@@ -104,6 +108,11 @@ def _evaluate_seed_values(
     batch_size = int(seed_values.shape[0])
     frame = _policy_obs_frame_from_state(env_cfg, state, hparams)
     history = jnp.repeat(frame[:, None, :], int(hparams.history_len), axis=1)
+    # [IMG] initial image history = first frame repeated (None when images are off)
+    img_history = (
+        init_image_history(render_policy_frame(env_cfg, state, render_cfg), image_history_len)
+        if use_images else None
+    )
 
     init_done = jnp.zeros((batch_size,), dtype=bool)
     init_returns = jnp.zeros((batch_size,), dtype=jnp.float32)
@@ -120,6 +129,7 @@ def _evaluate_seed_values(
         (
             _state,
             _history,
+            _img_history,  # [IMG]
             done,
             _returns,
             _success,
@@ -136,6 +146,7 @@ def _evaluate_seed_values(
         (
             curr_state,
             curr_history,
+            curr_img_history,  # [IMG]
             done,
             returns,
             success,
@@ -148,7 +159,8 @@ def _evaluate_seed_values(
         ) = carry
         key, step_key = jax.random.split(key)
         policy_obs = curr_history.reshape((batch_size, -1))
-        policy_action = policy_action_mean_fn(params, hparams, policy_obs)
+        img_kw = {"image_obs": curr_img_history} if use_images else {}  # [IMG]
+        policy_action = policy_action_mean_fn(params, hparams, policy_obs, **img_kw)  # [IMG]
         env_action = policy_action_to_env_action_fn(params, policy_action)
         next_state, reward, step_done, metrics = step_env(env_cfg, curr_state, env_action, step_key)
 
@@ -173,9 +185,18 @@ def _evaluate_seed_values(
         next_frame = _policy_obs_frame_from_state(env_cfg, selected_state, hparams)
         shifted_history = jnp.concatenate([curr_history[:, 1:, :], next_frame[:, None, :]], axis=1)
         next_history = jnp.where(active[:, None, None], shifted_history, curr_history)
+        # [IMG] same rule as the vector history above: shift in a new image while the episode is running,
+        # freeze it once the episode has ended (eval does not auto-reset)
+        if use_images:
+            next_image = render_policy_frame(env_cfg, selected_state, render_cfg)
+            shifted_img = jnp.concatenate([curr_img_history[:, 1:], next_image[:, None]], axis=1)
+            next_img_history = jnp.where(active[:, None, None, None, None], shifted_img, curr_img_history)
+        else:
+            next_img_history = None
         return (
             selected_state,
             next_history,
+            next_img_history,  # [IMG]
             next_done,
             returns,
             success,
@@ -190,6 +211,7 @@ def _evaluate_seed_values(
     (
         _state,
         _history,
+        _img_history,  # [IMG]
         done,
         returns,
         success,
@@ -205,6 +227,7 @@ def _evaluate_seed_values(
         (
             state,
             history,
+            img_history,  # [IMG]
             init_done,
             init_returns,
             init_success,
@@ -252,6 +275,8 @@ def evaluate_jax_env(
     policy_action_to_env_action_fn=None,
     history_len=None,
     include_paper_metrics=False,
+    render_cfg=None,  # [IMG]
+    image_history_len=4,  # [IMG]
 ):
     """Run deterministic evaluation using fixed-ID observation history."""
     env_cfg = env_cfg_or_config
@@ -268,6 +293,8 @@ def evaluate_jax_env(
         seed_values,
         policy_action_mean_fn=policy_action_mean_fn,
         policy_action_to_env_action_fn=policy_action_to_env_action_fn,
+        render_cfg=render_cfg,  # [IMG]
+        image_history_len=image_history_len,  # [IMG]
     )
     returns_np = np.asarray(returns, dtype=np.float32)
     success_np = np.asarray(success, dtype=np.float32)

@@ -6,6 +6,7 @@ import jax
 import jax.numpy as jnp
 
 from env.jax_social_nav import fixed_order_policy_obs_from_state, reset_env, step_env
+from env.jax_image_renderer import render_policy_frame, update_image_history  # [IMG] image renderer + image history
 from trainer.jax_ppo_core import flat_time_batch
 
 
@@ -157,9 +158,16 @@ def _update_ppo_episode_returns(running_returns, reward, done_bool):
     return next_returns.astype(jnp.float32), logged_returns.astype(jnp.float32)
 
 
-def make_rollout_collector(model_module, use_qp):
-    """Create a model-specific collector; ``use_qp`` is static before JIT tracing."""
+def make_rollout_collector(model_module, use_qp, render_cfg=None):
+    """Create a model-specific collector; ``use_qp`` and ``render_cfg`` are static before JIT tracing.
+
+    [IMG] When ``render_cfg`` (an env.jax_render.RenderConfig) is given, the collector also keeps an
+    image history and passes it to the model as ``image_obs``. env_state is then a 4-tuple
+    (nav_state, obs_history, image_history, ppo_episode_returns) instead of the usual 3-tuple.
+    The vector history is always kept: build_qp_context needs it for the CVaR-CBF QP.
+    """
     use_qp = bool(use_qp)
+    use_images = render_cfg is not None  # [IMG] static: MLP/GNN runs pass None and skip rendering
 
     def collect(
         params,
@@ -170,17 +178,24 @@ def make_rollout_collector(model_module, use_qp):
         steps_per_env,
         global_step=0,
     ):
-        nav_state, obs_history, ppo_episode_returns = env_state
+        # [IMG] unpack the image history when images are on; None is an empty pytree, so lax.scan accepts it
+        if use_images:
+            nav_state, obs_history, image_history, ppo_episode_returns = env_state
+        else:
+            nav_state, obs_history, ppo_episode_returns = env_state
+            image_history = None
+
         batch_size = int(nav_state.robot_state.shape[0])
         act_dim = int(hparams.act_dim)
 
         def body(carry, _unused):
-            state, history, running_ppo_returns, key = carry
+            state, history, img_hist, running_ppo_returns, key = carry  # [IMG] img_hist added to the carry
             key, noise_key, env_key, reset_key = jax.random.split(key, 4)
             policy_obs = history.reshape((batch_size, -1))
             noise = jax.random.normal(noise_key, (batch_size, act_dim), dtype=jnp.float32)
+            img_kw = {"image_obs": img_hist} if use_images else {}  # [IMG] extra model input (uint8 B,T,H,W,3)
             if use_qp:
-                qp_context = model_module.build_qp_context(policy_obs, hparams)
+                qp_context = model_module.build_qp_context(policy_obs, hparams)  # QP still uses the vector obs
                 env_action, logp, _entropy, value, policy_action, qp_diagnostics = (
                     model_module.get_action_and_value(
                         params,
@@ -190,6 +205,7 @@ def make_rollout_collector(model_module, use_qp):
                         return_policy_action=True,
                         return_diagnostics=True,
                         qp_context=qp_context,
+                        **img_kw,  # [IMG]
                     )
                 )
             else:
@@ -199,6 +215,7 @@ def make_rollout_collector(model_module, use_qp):
                     policy_obs,
                     noise=noise,
                     return_policy_action=True,
+                    **img_kw,  # [IMG]
                 )
 
             next_state, reward, done, metrics = step_env(env_cfg, state, env_action, env_key)
@@ -213,6 +230,13 @@ def make_rollout_collector(model_module, use_qp):
             next_state = _maybe_reset_done_envs(env_cfg, next_state, reset_key, done_bool, batch_size)
             next_frame = fixed_order_policy_obs_from_state(env_cfg, next_state)
             next_history = _update_obs_history(history, next_frame, done_bool)
+            # [IMG] render AFTER the reset (same place as next_frame), so a finished env gets the first frame of
+            # its new episode, and done_bool overwrites its whole image history, exactly like the vector history.
+            if use_images:
+                next_image = render_policy_frame(env_cfg, next_state, render_cfg)  # [IMG] pass render_cfg
+                next_img_hist = update_image_history(img_hist, next_image, done_bool)
+            else:
+                next_img_hist = None
 
             if use_qp:
                 transition = {
@@ -271,16 +295,20 @@ def make_rollout_collector(model_module, use_qp):
                     "robot_omega_delta": metrics["robot_omega_delta"],
                     "robot_omega_delta_penalty": metrics["robot_omega_delta_penalty"],
                 }
-            return (next_state, next_history, next_ppo_returns, key), transition
+            if use_images:
+                transition["img"] = img_hist  # [IMG] the image history the action was chosen from (same step as "obs")
+            return (next_state, next_history, next_img_hist, next_ppo_returns, key), transition  # [IMG] carry
 
-        (next_state, next_history, next_ppo_returns, next_rng), transitions = jax.lax.scan(
+        # [IMG] image history added to both the scan output and the initial carry
+        (next_state, next_history, next_img_hist, next_ppo_returns, next_rng), transitions = jax.lax.scan(
             body,
-            (nav_state, obs_history, ppo_episode_returns, rng),
+            (nav_state, obs_history, image_history, ppo_episode_returns, rng),
             None,
             length=int(steps_per_env),
         )
         next_policy_obs = next_history.reshape((batch_size, -1))
-        next_value = model_module.critic_value(params, hparams, next_policy_obs)
+        next_img_kw = {"image_obs": next_img_hist} if use_images else {}  # [IMG] bootstrap value sees images too
+        next_value = model_module.critic_value(params, hparams, next_policy_obs, **next_img_kw)  # [IMG]
         beta_budget = (
             float(hparams.beta_max)
             if use_qp and hasattr(hparams, "beta_max")
@@ -315,6 +343,12 @@ def make_rollout_collector(model_module, use_qp):
                 "global_step": jnp.asarray(global_step, dtype=jnp.int32) + int(steps_per_env) * batch_size,
                 **summary,
             }
-        return batch, (next_state, next_history, next_ppo_returns), next_rng
+        # [IMG] images go into the batch as uint8 (B*steps, T, H, W, 3); the model converts them to float
+        if use_images:
+            batch["img"] = flat_time_batch(transitions["img"])
+            next_env_state = (next_state, next_history, next_img_hist, next_ppo_returns)
+        else:
+            next_env_state = (next_state, next_history, next_ppo_returns)
+        return batch, next_env_state, next_rng  # [IMG] 4-tuple env_state when images are on
 
     return collect

@@ -1,0 +1,44 @@
+type: ppo_cnn
+robot_type: ${robot.type}
+
+# Vector history: still built by the trainer (shape checks, optional state critic), but never used by the actor
+history_len: 3
+obs_frame_dim: ${add:6,${mul:${env.humans.num_humans},6}}
+obs_dim: ${mul:${model.history_len},${model.obs_frame_dim}}
+
+# Image input (env/jax_image_renderer.py). This block turns on image rendering in the trainer.
+image_history_len: 4          # latest 3 or 4 frames, stacked on channels -> 3 * 4 = 12 input channels
+render:
+  image_size: 84              # H = W
+  half_extent: 7.0            # metres from centre to edge -> 0.167 m/px
+  view: egocentric            # robot centred, heading up
+  goal_radius: 0.3
+  goal_clip_to_border: true
+  heading_tick: true
+  tick_width_px: 2.0
+
+actor:
+  # Policy head and exploration (same as ppo_mlp)
+  hidden_dim: 256
+  control_hidden_dim: 256
+  act: relu
+  action_std_init: 0.5
+
+  # CNN trunk (Nature-DQN layout, as in CleanRL ppo_atari): 84 -> 20 -> 9 -> 7
+  cnn:
+    channels: [32, 64, 64]
+    kernels: [8, 4, 3]
+    strides: [4, 2, 1]
+    latent_dim: 512
+
+critic:
+  input: image                # image: shares the CNN trunk | state: asymmetric critic on ppo_mlp features
+  hidden_dim: 256
+  hidden_dim2: 256
+  act: relu
+  # used only when input: state (same encoder sizes and scaling as ppo_mlp)
+  encoder_hidden_dim: 64
+  encoder_latent_dim: 16
+  encoder_layers: 3
+  position_scale: ${env.farthest_dist}
+  velocity_scale: ${robot.v_max}
