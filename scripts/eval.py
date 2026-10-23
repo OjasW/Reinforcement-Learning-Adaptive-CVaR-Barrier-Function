@@ -13,194 +13,19 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-def _frame_to_rgb_array(frame):
-    if hasattr(frame, "convert"):
-        return np.asarray(frame.convert("RGB"), dtype=np.uint8)
-    array = np.asarray(frame)
-    if array.ndim == 2:
-        array = np.repeat(array[:, :, None], 3, axis=2)
-    elif array.shape[-1] == 4:
-        array = array[:, :, :3]
-    if array.dtype != np.uint8:
-        array = np.clip(array, 0, 255).astype(np.uint8)
-    return array
+SCRIPTS_DIR = Path(__file__).resolve().parent
+if str(SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS_DIR))
 
 
-def save_video(path, frames, fps=30):
-    import imageio
-
-    frames = [_frame_to_rgb_array(frame) for frame in frames]
-    imageio.mimsave(path, frames, fps=fps)
-
-
-def _scalar(value):
-    return float(np.asarray(value).reshape(-1)[0])
-
-
-def render_jax_social_nav_frame(
-    env_cfg,
-    state,
-    total_return=0.0,
-    status="",
-    size=740,
-    robot_traj=None,
-    qp_viz=None,
-):
-    """Render one JAX SocialNav state as a Matplotlib frame."""
-    from matplotlib.backends.backend_agg import FigureCanvasAgg
-    from matplotlib.collections import LineCollection
-    from matplotlib.colors import LinearSegmentedColormap, Normalize, to_rgba
-    from matplotlib.figure import Figure
-    from matplotlib.lines import Line2D
-    from matplotlib.patches import Circle
-
-    robot_state = np.asarray(state.robot_state[0], dtype=float)
-    robot_pos = robot_state[:2]
-    robot_theta = float(robot_state[2]) if robot_state.shape[0] > 2 else 0.0
-    robot_radius = float(env_cfg.robot_radius)
-    human_positions = np.asarray(state.human_positions[0], dtype=float)
-    human_radii = np.asarray(state.human_radii[0], dtype=float)
-    human_mask = np.asarray(state.human_mask[0], dtype=float) > 0.5
-    goal_pos = np.asarray(state.goal_pos[0], dtype=float)
-
-    robot_traj_arr = np.asarray(robot_traj if robot_traj is not None else [robot_pos], dtype=float)
-    start_pos = np.asarray(robot_traj_arr[0] if robot_traj_arr.size else robot_pos, dtype=float)
-
-    low = np.asarray(getattr(env_cfg, "workspace_low", [-6.0, -6.0]), dtype=float)
-    high = np.asarray(getattr(env_cfg, "workspace_high", [6.0, 6.0]), dtype=float)
-    boundary_buffer = max(float(getattr(env_cfg, "boundary_buffer", 0.0)), 0.0)
-    plot_low = low - boundary_buffer
-    plot_high = high + boundary_buffer
-    plot_span = np.maximum(plot_high - plot_low, 1e-6)
-    plot_aspect = float(plot_span[0] / plot_span[1])
-
-    frame_width = max(16, int(np.ceil(float(size) / 16.0)) * 16)
-    frame_height = max(16, int(np.ceil((frame_width / plot_aspect) / 16.0)) * 16)
-    dpi = max(80, int(size / 7.4))
-    fig = Figure(figsize=(frame_width / dpi, frame_height / dpi), dpi=dpi, facecolor="white")
-    canvas = FigureCanvasAgg(fig)
-    ax = fig.subplots()
-    fig.subplots_adjust(left=0.11, right=0.97, bottom=0.13, top=0.90)
-
-    ax.clear()
-    ax.set_xlim(float(plot_low[0]), float(plot_high[0]))
-    ax.set_ylim(float(plot_low[1]), float(plot_high[1]))
-    ax.set_aspect("equal")
-    ax.set_facecolor("white")
-
-    robot_color = "#3b82f6"
-    traj_cmap = LinearSegmentedColormap.from_list("robot_traj", ["#dbeafe", robot_color])
-    qp_viz = qp_viz or {}
-    robot_type = str(getattr(env_cfg, "robot_type", "unicycle"))
-    lookahead_distance = float(qp_viz.get("lookahead_distance", 0.0) or 0.0)
-    if robot_type != "unicycle":
-        lookahead_distance = 0.0
-
-    topk_ids = np.asarray(qp_viz.get("topk_ids", []), dtype=int).reshape(-1)
-    r_safe = np.asarray(qp_viz.get("r_safe", []), dtype=float).reshape(-1)
-    beta = np.asarray(qp_viz.get("beta", []), dtype=float).reshape(-1)
-    beta_min = float(qp_viz.get("beta_min", 0.05) or 0.05)
-    beta_total = float(
-        qp_viz.get("beta_total", qp_viz.get("beta_max", 0.5)) or 0.5
-    )
-    active_topk_count = sum(
-        0 <= human_id < human_positions.shape[0]
-        and (human_id >= human_mask.shape[0] or bool(human_mask[human_id]))
-        for human_id in topk_ids
-    )
-    remaining_beta_budget = max(beta_total - active_topk_count * beta_min, 1e-6)
-    beta_individual_max = beta_min + remaining_beta_budget
-    base_human_color = np.asarray(to_rgba("#8c8c8c"), dtype=float)
-    risky_human_color = np.asarray(to_rgba("#dc2626"), dtype=float)
-    human_colors = np.repeat(base_human_color[None, :], human_positions.shape[0], axis=0)
-    for rank, human_id in enumerate(topk_ids):
-        if human_id < 0 or human_id >= human_positions.shape[0] or rank >= r_safe.shape[0]:
-            continue
-        if human_id < human_mask.shape[0] and not human_mask[human_id]:
-            continue
-        beta_i = (
-            float(beta[rank])
-            if rank < beta.shape[0] and np.isfinite(beta[rank])
-            else beta_individual_max
-        )
-        beta_t = np.clip(
-            (beta_i - beta_min) / remaining_beta_budget, 0.0, 1.0
-        )
-        human_colors[human_id] = risky_human_color * (1.0 - beta_t) + base_human_color * beta_t
-        adaptive_radius = float(r_safe[rank]) - robot_radius
-        if not np.isfinite(adaptive_radius):
-            continue
-        adaptive_radius = max(adaptive_radius, float(human_radii[human_id]))
-        ax.add_artist(
-            Circle(
-                human_positions[human_id],
-                adaptive_radius,
-                facecolor=to_rgba("#9ca3af", 0.16),
-                edgecolor="none",
-                linewidth=0.0,
-                zorder=1.7,
-            )
-        )
-
-    for i, pos in enumerate(human_positions):
-        if i < human_mask.shape[0] and not human_mask[i]:
-            continue
-        ax.add_artist(Circle(pos, human_radii[i], facecolor=human_colors[i], edgecolor="none", linewidth=0.0, alpha=0.95, zorder=2))
-
-    if robot_traj_arr.shape[0] > 1:
-        points = robot_traj_arr.reshape(-1, 1, 2)
-        segments = np.concatenate([points[:-1], points[1:]], axis=1)
-        seg_values = np.linspace(0.0, 1.0, len(segments), dtype=float)
-        collection = LineCollection(
-            segments,
-            cmap=traj_cmap,
-            norm=Normalize(vmin=0.0, vmax=1.0),
-            linewidths=4.4,
-            alpha=0.98,
-            zorder=4,
-        )
-        collection.set_array(seg_values)
-        collection.set_capstyle("round")
-        ax.add_collection(collection)
-
-    ax.add_artist(Circle(robot_pos, robot_radius, facecolor=robot_color, edgecolor="none", linewidth=0.0, alpha=0.82, zorder=6))
-    if lookahead_distance > 0.0:
-        lookahead_point = robot_pos + lookahead_distance * np.asarray([np.cos(robot_theta), np.sin(robot_theta)], dtype=float)
-        ax.add_artist(
-            Circle(
-                lookahead_point,
-                robot_radius + lookahead_distance,
-                facecolor="none",
-                edgecolor="#1d4ed8",
-                linewidth=1.4,
-                linestyle="--",
-                alpha=0.7,
-                zorder=7,
-            )
-        )
-        ax.plot([robot_pos[0], lookahead_point[0]], [robot_pos[1], lookahead_point[1]], color="#1d4ed8", linewidth=1.2, alpha=0.85, zorder=8)
-        ax.scatter([lookahead_point[0]], [lookahead_point[1]], s=56, c="#1d4ed8", edgecolors="white", linewidths=0.8, zorder=9)
-
-    ax.scatter([start_pos[0]], [start_pos[1]], s=420, marker="^", c="#ead94c", edgecolors="none", linewidths=0.0, zorder=8)
-    ax.add_artist(Circle(goal_pos, 0.3, facecolor="#ead94c", edgecolor="#d2bc38", linewidth=1.2, alpha=0.65, zorder=7))
-
-    start_handle = Line2D([0], [0], marker="^", linestyle="None", markerfacecolor="#ead94c", markeredgecolor="none", markersize=9, label="Start")
-    goal_handle = Line2D([0], [0], marker="o", linestyle="None", markerfacecolor="#ead94c", markeredgecolor="#d2bc38", markeredgewidth=1.0, markersize=9, label="Goal")
-    traj_handle = Line2D([0], [0], color=robot_color, linewidth=4.4, alpha=0.98, label="Trajectory")
-    handles = [start_handle, goal_handle, traj_handle]
-    ax.legend(handles=handles, loc="upper right", frameon=True, fontsize=13, borderpad=0.3, handletextpad=0.4)
-
-    ax.grid(False)
-    ax.tick_params(labelsize=18, colors="black")
-    current_time = float(_scalar(state.step_count[0])) * float(env_cfg.dt)
-    title = f"Time: {current_time:.1f}s"
-    if status:
-        title += f" | {status}"
-    ax.set_title(title, fontsize=20, pad=7, color="black")
-
-    canvas.draw()
-    rgba = np.asarray(canvas.buffer_rgba())
-    return rgba[:, :, :3].copy()
+from eval_video import (  # noqa: E402
+    _frame_to_rgb_array,
+    _scalar,
+    init_render_worker,
+    render_jax_social_nav_frame,
+    render_job,
+    save_video,
+)
 
 
 class Evaluator:
@@ -211,9 +36,15 @@ class Evaluator:
         device=None,
         seeds=None,
         episodes=None,
+        policy_view=False, # [IMG] add the CNN's input images next to the arena in --visualize videos
+        workers=None,  # [SPEED] processes drawing video frames in parallel (0 = draw in this process)
+        vis_batch=16,  # [SPEED] episodes simulated together per compiled visualize rollout
     ):
         self.save_dir = Path(save_dir)
         self.visualize = bool(visualize)
+        self.policy_view = bool(policy_view)
+        self.workers = workers
+        self.vis_batch = max(1, int(vis_batch))
         self.seeds = list(seeds) if seeds is not None else None
         self.episodes = int(episodes) if episodes is not None else None
         self.video_save_dir = None
@@ -222,6 +53,14 @@ class Evaluator:
             self.config.device = str(device)
         self.jax_params = None
         self._jax_configured = False
+
+        # [SPEED] built once per Evaluator and reused for every checkpoint: the same objects must be passed to
+        # trainer.jax_ppo_eval each time so its compiled rollout is reused instead of recompiled.
+        self._cache = {}
+        if self.policy_view and not self.visualize:
+            raise ValueError("--policy-view only together with --visualize")
+        if self.policy_view and self._render_settings()[0] is None:
+            raise ValueError("--policy-view needs an image model (a model.render block, e.g. model=ppo_cnn)")
 
     def _configure_jax(self):
         if self._jax_configured:
@@ -237,13 +76,38 @@ class Evaluator:
         return get_jax_model_module(self.config.model)
 
     def _hparams(self):
-        self._configure_jax()
-        model_module = self._model_module()
-        return model_module.hparams_from_config(
-            self.config.model,
-            self.config.model.critic,
-            act_dim=int(self.config.env.act_dim),
-        )
+        if "hparams" not in self._cache: # [SPEED] one object for all checkpoints (compile-cache key)
+            self._configure_jax()
+            model_module = self._model_module()
+            self._cache["hparams"] = model_module.hparams_from_config(
+                self.config.model,
+                self.config.model.critic,
+                act_dim=int(self.config.env.act_dim),
+            )
+            return self._cache["hparams"]
+
+    def _env_cfg(self):
+        if "env_cfg" not in self._cache:  # [SPEED] one object for all checkpoints (compile-cache key)
+            self._configure_jax()
+            from env.jax_social_nav import config_from_omegaconf
+ 
+            self._cache["env_cfg"] = config_from_omegaconf(self.config)
+        return self._cache["env_cfg"]
+
+    def _render_settings(self):
+        """[IMG] (RenderConfig or None, image_history_len). Same rule as the trainer: images only if model.render exists."""
+        if "render" not in self._cache:
+            render_node = self.config.model.get("render", None)
+            if render_node is None:
+                self._cache["render"] = (None, 4)
+            else:
+                from env.jax_image_renderer import render_config_from_omegaconf
+ 
+                self._cache["render"] = (
+                    render_config_from_omegaconf(render_node),
+                    int(self.config.model.get("image_history_len", 4)),
+                )
+        return self._cache["render"]
 
     def evaluate_one_ckpt(self, ckpt_path):
         self._configure_jax()
@@ -299,188 +163,284 @@ class Evaluator:
 
         model_module = self._model_module()
         episodes = int(self.episodes) if self.episodes is not None else int(self.config.trainer.eval_episodes)
+        render_cfg, image_history_len = self._render_settings()  # [IMG]
         return evaluate_jax_env(
             self.jax_params,
             self._hparams(),
-            self.config,
+            self._env_cfg(),  # [SPEED] cached object (was self.config, rebuilt on every call -> recompiled)
             episodes=episodes,
             policy_action_mean_fn=model_module.policy_action_mean,
             policy_action_to_env_action_fn=model_module.policy_action_to_env_action,
             seeds=self.seeds,
             include_paper_metrics=True,
+            render_cfg=render_cfg, #[IMG]
+            image_history_len=image_history_len # [IMG]
         )
+
+# --------- Visualize --------- #
+# [SPEED] The old loop ran step_env, the policy and the obs update un-jitted, one Python call per step.
+# step_env contains inner lax.scan / vmap calls, so every eager call recompiled them: ~2 s per env step
+# Now each episode is one lax.scan over max_steps, many episodes run side by side (vmap), and it is compiled once per Evaluator.
+# Randomness is unchanged: rng = PRNGKey(seed + ep), one split for the reset, one split per step, and each
+# episode still steps a batch-1 env, so videos show the same scenarios as before.
+
+    def _visualize_rollout_fn(self):
+        if "vis_fn" in self._cache:
+            return self._cache["vis_fn"]
+        import jax
+        import jax.numpy as jnp
+ 
+        from env.jax_social_nav import fixed_order_policy_obs_from_state, reset_env, step_env
+ 
+        env_cfg = self._env_cfg()
+        model_module = self._model_module()
+        hparams = self._hparams()
+        history_len = int(self.config.model.history_len)
+        render_cfg, image_history_len = self._render_settings()  # [IMG]
+        use_images = render_cfg is not None
+        record_images = use_images and self.policy_view
+        has_qp_viz = hasattr(model_module, "build_qp_context") and hasattr(model_module, "safe_action_mean")
+        max_steps = int(env_cfg.max_steps)
+        if use_images:
+            from env.jax_image_renderer import init_image_history, render_policy_frame
+ 
+        def policy_step(params, policy_obs, img_hist):
+            img_kw = {"image_obs": img_hist} if use_images else {}  # [IMG] ppo_cnn acts on images only
+            if not has_qp_viz:
+                policy_action = model_module.policy_action_mean(params, hparams, policy_obs, **img_kw)
+                return model_module.policy_action_to_env_action(params, policy_action), {}
+            qp_context = model_module.build_qp_context(policy_obs, hparams)
+            policy_action = model_module.safe_action_mean(params, hparams, policy_obs, qp_context=qp_context)
+            action, _logprob, _entropy, _value, diagnostics = model_module.get_action_and_value(
+                params, hparams, policy_obs, policy_action=policy_action,
+                return_diagnostics=True, qp_context=qp_context,
+            )
+            viz = {"qp_topk_ids": qp_context["qp_topk_ids"]}
+            for name in ("r_safe", "beta", "alpha", "qp_slack", "qp_slack_max", "qp_correction"):
+                if name in diagnostics:
+                    viz[name] = diagnostics[name]
+            return action, viz
+
+        def episode(params, rng):
+            rng, reset_key = jax.random.split(rng)
+            state = reset_env(env_cfg, reset_key, 1)
+            frame = fixed_order_policy_obs_from_state(env_cfg, state)
+            history = jnp.repeat(frame[:, None, :], history_len, axis=1)
+            img_hist = (  # [IMG] first image repeated, exactly as in training
+                init_image_history(render_policy_frame(env_cfg, state, render_cfg), image_history_len)
+                if use_images else None
+            )
+
+            def body(carry, _unused):
+                state, history, img_hist, rng = carry
+                action, viz = policy_step(params, history.reshape((1, -1)), img_hist)
+                rng, step_key = jax.random.split(rng)
+                next_state, reward, done, metrics = step_env(env_cfg, state, action, step_key)
+                next_frame = fixed_order_policy_obs_from_state(env_cfg, next_state)
+                next_history = jnp.concatenate([history[:, 1:, :], next_frame[:, None, :]], axis=1)
+                rec = {
+                    "state": state,  # state BEFORE this step (what the old trace stored)
+                    "reward": reward[0],
+                    "done": done[0] > 0.5,
+                    "success": metrics["success"][0] > 0.5,
+                    "collision": metrics["collision"][0] > 0.5,
+                    "viz": viz,
+                }
+                if use_images:  # [IMG]
+                    next_img = render_policy_frame(env_cfg, next_state, render_cfg)
+                    next_img_hist = jnp.concatenate([img_hist[:, 1:], next_img[:, None]], axis=1)
+                    if record_images:
+                        rec["img"] = img_hist[0, -1]  # newest frame only; the 4-frame stack is rebuilt on the host
+                else:
+                    next_img_hist = None
+                return (next_state, next_history, next_img_hist, rng), rec
+ 
+            (final_state, _h, final_img_hist, _rng), recs = jax.lax.scan(
+                body, (state, history, img_hist, rng), None, length=max_steps
+            )
+            out = {"recs": recs, "final_state": final_state}
+            if record_images:
+                out["final_img"] = final_img_hist[0, -1]
+            return out
+ 
+        fn = jax.jit(jax.vmap(episode, in_axes=(None, 0)))
+        self._cache["vis_fn"] = fn
+        return fn
+
+    def _render_pool(self):
+        """[SPEED] Worker processes for matplotlib frames (~90 ms each). 'spawn': never fork a JAX process."""
+        import multiprocessing as mp
+        import os
+ 
+        n = self.workers if self.workers is not None else min(8, os.cpu_count() or 1)
+        if n <= 0:
+            return None
+        env_cfg = self._env_cfg()
+        ctx = mp.get_context("spawn")
+        return ctx.Pool(n, initializer=init_render_worker, initargs=(self._env_lite(env_cfg),))
+
+    @staticmethod
+    def _env_lite(env_cfg):
+        """Only what render_jax_social_nav_frame reads, as plain numpy/python (cheap to send to workers)."""
+        from types import SimpleNamespace
+ 
+        return SimpleNamespace(
+            workspace_low=np.asarray(env_cfg.workspace_low, dtype=float),
+            workspace_high=np.asarray(env_cfg.workspace_high, dtype=float),
+            boundary_buffer=float(getattr(env_cfg, "boundary_buffer", 0.0)),
+            robot_radius=float(env_cfg.robot_radius),
+            robot_type=str(getattr(env_cfg, "robot_type", "unicycle")),
+            dt=float(env_cfg.dt),
+        )
+
+    def _qp_viz_from(self, viz, k):
+        """Rebuild the old per-step qp_viz dict from the recorded arrays (same fields and conversions)."""
+        if not viz:
+            return None
+        hparams = self._hparams()
+ 
+        def first_array(name):
+            if name not in viz:
+                return np.asarray(())
+            value = np.asarray(viz[name][k])
+            if value.size == 0:
+                return value
+            if value.ndim == 0:
+                return value.reshape(1)
+            return value[0]
+ 
+        def first_scalar(name):
+            value = np.asarray(viz[name][k]).reshape(-1)
+            return float(value[0]) if value.size else 0.0
+ 
+        return {
+            "topk_ids": np.asarray(viz["qp_topk_ids"][k][0], dtype=int),
+            "r_safe": np.asarray(first_array("r_safe"), dtype=float),
+            "beta": np.asarray(first_array("beta"), dtype=float),
+            "alpha": np.asarray(first_array("alpha"), dtype=float),
+            "slack_mean": first_scalar("qp_slack"),
+            "slack_max": first_scalar("qp_slack_max"),
+            "qp_correction": first_scalar("qp_correction"),
+            "lookahead_distance": (
+                float(hparams.lookahead_distance) if hparams.robot_type == "unicycle" else 0.0
+            ),
+            "beta_min": float(getattr(hparams, "beta_min", 0.05)),
+            "beta_total": float(getattr(hparams, "beta_max", 0.5)),
+        }
+
+    def _policy_window(self, state_lite):
+        """[IMG] World-frame corners of the CNN's image window for this state (dashed square in the arena)."""
+        render_cfg, _ = self._render_settings()
+        h = float(render_cfg.half_extent)
+        if render_cfg.view == "egocentric":
+            x, y, theta = (float(v) for v in state_lite.robot_state[0][:3])
+            fwd = np.array([np.cos(theta), np.sin(theta)])
+            left = np.array([-np.sin(theta), np.cos(theta)])
+            center = np.array([x, y])
+        else:
+            env_cfg = self._env_cfg()
+            center = 0.5 * (np.asarray(env_cfg.workspace_low, float) + np.asarray(env_cfg.workspace_high, float))
+            fwd, left = np.array([0.0, 1.0]), np.array([-1.0, 0.0])
+        return np.stack([center + h * (fwd + left), center + h * (fwd - left),
+                         center - h * (fwd + left), center - h * (fwd - left)])
 
     def evaluate_visualize(self):
         self._configure_jax()
         import jax
-        import jax.numpy as jnp
-
-        from env.jax_social_nav import (
-            config_from_omegaconf,
-            fixed_order_policy_obs_from_state,
-            reset_env,
-            step_env,
-        )
-
-        env_cfg = config_from_omegaconf(self.config)
-        model_module = self._model_module()
-        hparams = self._hparams()
-        history_len = int(self.config.model.history_len)
+        from types import SimpleNamespace
+ 
+        env_cfg = self._env_cfg()
+        _, image_history_len = self._render_settings()
+        max_steps = int(env_cfg.max_steps)
         seeds = self.seeds if self.seeds is not None else list(range(100, 1000 + 1, 100))
         episodes = int(self.episodes) if self.episodes is not None else int(self.config.trainer.eval_episodes)
+        rollout_seeds = [seed + ep for seed in seeds for ep in range(episodes)]
+        fps = int(round(1.0 / float(env_cfg.dt)))
+        env_lite = self._env_lite(env_cfg)
+        rollout = self._visualize_rollout_fn()
+        batch = min(self.vis_batch, len(rollout_seeds))
+ 
         returns = []
-        success_count = 0
-        collision_count = 0
-        timeout_count = 0
-        total_episodes = 0
-        has_qp_viz = hasattr(model_module, "build_qp_context") and hasattr(model_module, "safe_action_mean")
-        def compute_action_and_qp_viz(policy_obs):
-            if not has_qp_viz:
-                policy_action = model_module.policy_action_mean(self.jax_params, hparams, policy_obs)
-                action = model_module.policy_action_to_env_action(self.jax_params, policy_action)
-                return action, None
-
-            qp_context = model_module.build_qp_context(policy_obs, hparams)
-            policy_action = model_module.safe_action_mean(
-                self.jax_params,
-                hparams,
-                policy_obs,
-                qp_context=qp_context,
-            )
-            action, _logprob, _entropy, _value, diagnostics = model_module.get_action_and_value(
-                self.jax_params,
-                hparams,
-                policy_obs,
-                policy_action=policy_action,
-                return_diagnostics=True,
-                qp_context=qp_context,
-            )
-            ctx_cpu = jax.device_get(qp_context)
-            diag_cpu = jax.device_get(diagnostics)
-            def first_array(name, default=()):
-                value = np.asarray(diag_cpu.get(name, default))
-                if value.size == 0:
-                    return value
-                if value.ndim == 0:
-                    return value.reshape(1)
-                return value[0]
-
-            def first_scalar(name):
-                value = np.asarray(diag_cpu[name]).reshape(-1)
-                return float(value[0]) if value.size else 0.0
-
-            qp_viz = {
-                "topk_ids": np.asarray(ctx_cpu["qp_topk_ids"][0], dtype=int),
-                "r_safe": np.asarray(first_array("r_safe"), dtype=float),
-                "beta": np.asarray(first_array("beta"), dtype=float),
-                "alpha": np.asarray(first_array("alpha"), dtype=float),
-                "slack_mean": first_scalar("qp_slack"),
-                "slack_max": first_scalar("qp_slack_max"),
-                "qp_correction": first_scalar("qp_correction"),
-                "lookahead_distance": (
-                    float(hparams.lookahead_distance)
-                    if hparams.robot_type == "unicycle"
-                    else 0.0
-                ),
-                "beta_min": float(getattr(hparams, "beta_min", 0.05)),
-                "beta_total": float(getattr(hparams, "beta_max", 0.5)),
-            }
-            return action, qp_viz
-
-        for seed in tqdm(seeds, desc="Visualizing"):
-            for ep in range(episodes):
-                rng = jax.random.PRNGKey(seed + ep)
-                rng, reset_key = jax.random.split(rng)
-                state = reset_env(env_cfg, reset_key, 1)
-                state_cpu = jax.device_get(state)
-                robot_traj = [np.asarray(state_cpu.robot_state[0][:2], dtype=float)]
-                frame = fixed_order_policy_obs_from_state(env_cfg, state)
-                history = jnp.repeat(frame[:, None, :], history_len, axis=1)
-                total = 0.0
-                trace = []
-                status = "running"
-                success = False
-                collision = False
-                timeout = False
-                last_qp_viz = None
-
-                for _step in range(int(env_cfg.max_steps)):
-                    policy_obs = history.reshape((1, -1))
-                    action, qp_viz = compute_action_and_qp_viz(policy_obs)
-                    last_qp_viz = qp_viz
-                    trace.append(
-                        {
-                            "state": jax.device_get(state),
-                            "total": total,
-                            "status": status,
-                            "robot_traj": np.asarray(robot_traj, dtype=float).copy(),
-                            "qp_viz": qp_viz,
-                        }
-                    )
-                    rng, step_key = jax.random.split(rng)
-                    state, reward, done, metrics = step_env(env_cfg, state, action, step_key)
-                    state_cpu = jax.device_get(state)
-                    robot_traj.append(np.asarray(state_cpu.robot_state[0][:2], dtype=float))
-                    next_frame = fixed_order_policy_obs_from_state(env_cfg, state)
-                    history = jnp.concatenate([history[:, 1:, :], next_frame[:, None, :]], axis=1)
-                    total += float(jax.device_get(reward[0]))
-                    done_bool = bool(jax.device_get(done[0] > 0.5))
-                    if done_bool:
-                        raw_collision = bool(jax.device_get(metrics["collision"][0] > 0.5))
-                        raw_success = bool(jax.device_get(metrics["success"][0] > 0.5))
-                        collision = raw_collision
-                        success = (not collision) and raw_success
-                        timeout = not (collision or success)
-                        if collision:
-                            status = "collision"
-                        elif success:
-                            status = "success"
-                        elif timeout:
-                            status = "timeout"
-                        else:
-                            status = "done"
-                        trace.append(
-                            {
-                                "state": state_cpu,
-                                "total": total,
-                                "status": status,
-                                "robot_traj": np.asarray(robot_traj, dtype=float).copy(),
-                                "qp_viz": last_qp_viz,
-                            }
+        success_count = collision_count = timeout_count = total_episodes = 0
+        pool = self._render_pool()
+        progress = tqdm(total=len(rollout_seeds), desc="Visualizing")
+        try:
+            for start in range(0, len(rollout_seeds), batch):
+                chunk = rollout_seeds[start:start + batch]
+                padded = chunk + [chunk[-1]] * (batch - len(chunk))  # same batch size -> no recompile
+                keys = jax.numpy.stack([jax.random.PRNGKey(int(s)) for s in padded])
+                out = jax.device_get(rollout(self.jax_params, keys))  # one device->host copy per chunk
+                recs = out["recs"]
+ 
+                for e, rollout_seed in enumerate(chunk):
+                    done = np.asarray(recs["done"][e])
+                    d = int(np.argmax(done)) if done.any() else None
+                    n_items = max_steps if d is None else d + 1  # pre-step states shown (as before)
+ 
+                    def state_at(k, e=e):
+                        src = recs["state"] if k < max_steps else out["final_state"]
+                        idx = (e, k) if k < max_steps else (e,)
+                        pick = lambda a: np.asarray(a[idx])
+                        return SimpleNamespace(
+                            robot_state=pick(src.robot_state), human_positions=pick(src.human_positions),
+                            human_radii=pick(src.human_radii), human_mask=pick(src.human_mask),
+                            goal_pos=pick(src.goal_pos), step_count=pick(src.step_count),
                         )
-                        break
-
-                if not trace:
-                    trace.append(
-                        {
-                            "state": jax.device_get(state),
-                            "total": total,
-                            "status": status,
-                            "robot_traj": np.asarray(robot_traj, dtype=float).copy(),
-                            "qp_viz": last_qp_viz,
-                        }
-                    )
-                arena_frames = [
-                    render_jax_social_nav_frame(
-                        env_cfg,
-                        item["state"],
-                        item["total"],
-                        status=item["status"],
-                        robot_traj=item["robot_traj"],
-                        qp_viz=item["qp_viz"],
-                    )
-                    for item in trace
-                ]
-                rollout_seed = seed + ep
-                frames = arena_frames
-                video_path = self.video_save_dir / f"seed_{rollout_seed}_{status}.mp4"
-                save_video(video_path, frames, fps=int(round(1.0 / float(env_cfg.dt))))
-                returns.append(total)
-                total_episodes += 1
-                success_count += int(success)
-                collision_count += int(collision)
-                timeout_count += int(timeout or status == "running")
-
+ 
+                    states = [state_at(k) for k in range(n_items + (0 if d is None else 1))]
+                    robot_xy = np.stack([np.asarray(st.robot_state[0][:2], dtype=float) for st in states])
+                    rewards = np.asarray(recs["reward"][e])
+                    viz_e = {name: np.asarray(arr[e]) for name, arr in recs["viz"].items()}  # this episode's QP diagnostics
+ 
+                    frames_u8 = None
+                    if self.policy_view:  # [IMG] newest image per step; final one from the post-done state
+                        frames_u8 = list(np.asarray(recs["img"][e][: n_items]))
+                        if d is not None:
+                            frames_u8.append(np.asarray(recs["img"][e][d + 1]) if d + 1 < max_steps
+                                             else np.asarray(out["final_img"][e]))
+ 
+                    def stack_at(k):
+                        # [IMG] the exact CNN input at item k: frames k-T+1..k, first frame repeated at the start
+                        idx = [max(0, k - image_history_len + 1 + j) for j in range(image_history_len)]
+                        return np.stack([frames_u8[i] for i in idx])
+ 
+                    jobs, total = [], 0.0
+                    status, success, collision, timeout = "running", False, False, False
+                    for k in range(n_items):
+                        jobs.append((None, states[k], total, "running", robot_xy[: k + 1].copy(),
+                                     self._qp_viz_from(viz_e, k),
+                                     self._policy_window(states[k]) if self.policy_view else None,
+                                     stack_at(k) if self.policy_view else None))
+                        total += float(rewards[k])
+                    if d is not None:
+                        collision = bool(recs["collision"][e][d])
+                        success = (not collision) and bool(recs["success"][e][d])
+                        timeout = not (collision or success)
+                        status = "collision" if collision else "success" if success else "timeout"
+                        jobs.append((None, states[d + 1], total, status, robot_xy[: d + 2].copy(),
+                                     self._qp_viz_from(viz_e, d),
+                                     self._policy_window(states[d + 1]) if self.policy_view else None,
+                                     stack_at(d + 1) if self.policy_view else None))
+ 
+                    if pool is None:  # draw here
+                        frames = [render_job((env_lite,) + job[1:]) for job in jobs]
+                    else:  # [SPEED] draw in parallel, keep order
+                        frames = list(pool.imap(render_job, jobs, chunksize=8))
+                    video_path = self.video_save_dir / f"seed_{rollout_seed}_{status}.mp4"
+                    save_video(video_path, frames, fps=fps)
+ 
+                    returns.append(total)
+                    total_episodes += 1
+                    success_count += int(success)
+                    collision_count += int(collision)
+                    timeout_count += int(timeout or status == "running")
+                    progress.update(1)
+        finally:
+            progress.close()
+            if pool is not None:
+                pool.close()
+                pool.join()
+ 
         return {
             "mean_return": float(np.mean(returns)),
             "std_return": float(np.std(returns)),
@@ -531,6 +491,10 @@ if __name__ == "__main__":
     parser.add_argument("--device", default="", choices=["", "cpu", "cuda", "auto"], help="Override device from config for eval/visualize")
     parser.add_argument("--seeds", default="", help="Comma-separated eval seeds; default is 100,200,...,1000")
     parser.add_argument("--episodes", type=int, default=50, help="Episodes per seed; default: 50")
+    parser.add_argument("--policy-view", action="store_true", help="[IMG] with --visualize: add the CNN input images (ppo_cnn) next to the arena view")
+    parser.add_argument("--workers", type=int, default=None, help="[SPEED] processes drawing video frames in parallel (default: CPU count, max 8; 0 = off)")
+    parser.add_argument("--vis-batch", type=int, default=16, help="[SPEED] episodes simulated together in one compiled --visualize rollout")
+
     args = parser.parse_args()
     seeds = [int(seed.strip()) for seed in args.seeds.split(",") if seed.strip()] if args.seeds else None
     Evaluator(
@@ -539,4 +503,7 @@ if __name__ == "__main__":
         device=args.device or None,
         seeds=seeds,
         episodes=args.episodes,
+        policy_view=args.policy_view,
+        workers=args.workers,
+        vis_batch=args.vis_batch,
     ).eval_all_ckpts(checkpoint=args.checkpoint or None)

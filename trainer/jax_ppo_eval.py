@@ -87,6 +87,29 @@ def _policy_obs_frame_from_state(env_cfg, state, hparams):
             return _fixed_slot_policy_obs_from_state(env_cfg, state, model_humans)
     return fixed_order_policy_obs_from_state(env_cfg, state)
 
+def _seed_keys(seed_values):
+    """One reset key per episode, PRNGKey(seed + episode). Same keys as before the [SPEED] change."""
+    return jnp.stack([jax.random.PRNGKey(int(seed)) for seed in seed_values], axis=0)
+
+# [SPEED] Compiled-loop cache.
+_EVAL_FN_CACHE = {}
+
+def _cached_eval_loop(hparams, env_cfg, policy_action_mean_fn, policy_action_to_env_action_fn,
+                      render_cfg, image_history_len):
+    cache_key = (id(hparams), id(env_cfg), policy_action_mean_fn, policy_action_to_env_action_fn,
+                 render_cfg, int(image_history_len))
+    entry = _EVAL_FN_CACHE.get(cache_key)
+    # identity check guards against a reused id() after garbage collection (the entry also keeps both alive)
+    if entry is None or entry[0] is not hparams or entry[1] is not env_cfg:
+        fn = jax.jit(
+            lambda params, state, history, img_history: _eval_loop(
+                params, hparams, env_cfg, state, history, img_history,
+                policy_action_mean_fn, policy_action_to_env_action_fn, render_cfg, image_history_len,
+            )
+        )
+        entry = (hparams, env_cfg, fn)
+        _EVAL_FN_CACHE[cache_key] = entry
+    return entry[2]
 
 def _evaluate_seed_values(
     params,
@@ -97,15 +120,18 @@ def _evaluate_seed_values(
     policy_action_to_env_action_fn=None,
     render_cfg=None,  # [IMG] None -> no images (MLP/GNN)
     image_history_len=4,  # [IMG]
+    keys=None,  # [SPEED] precomputed reset keys
+    loop_fn=None,  # [SPEED] cached compiled episode loop from _cached_eval_loop (None = build it here)
 ):
     """Evaluate all requested episodes as one batched JAX env rollout."""
     use_images = render_cfg is not None  # [IMG] static
     if policy_action_mean_fn is None or policy_action_to_env_action_fn is None:
         raise ValueError("policy functions must be provided by the selected model")
-
-    keys = jnp.stack([jax.random.PRNGKey(int(seed)) for seed in seed_values], axis=0)
+ 
+    if keys is None:
+        keys = _seed_keys(seed_values)
     state = reset_env_with_keys(env_cfg, keys)
-    batch_size = int(seed_values.shape[0])
+    batch_size = int(keys.shape[0])
     frame = _policy_obs_frame_from_state(env_cfg, state, hparams)
     history = jnp.repeat(frame[:, None, :], int(hparams.history_len), axis=1)
     # [IMG] initial image history = first frame repeated (None when images are off)
@@ -113,7 +139,22 @@ def _evaluate_seed_values(
         init_image_history(render_policy_frame(env_cfg, state, render_cfg), image_history_len)
         if use_images else None
     )
+ 
+    # [SPEED] reset + first frames run exactly as before (eager), so episodes start from bit-identical states;
+    # only the episode loop below is compiled once and reused.
+    if loop_fn is None:
+        loop_fn = lambda p, st, h, ih: _eval_loop(
+            p, hparams, env_cfg, st, h, ih, policy_action_mean_fn, policy_action_to_env_action_fn,
+            render_cfg, image_history_len,
+        )
+    return loop_fn(params, state, history, img_history)
 
+def _eval_loop(params, hparams, env_cfg, state, history, img_history, policy_action_mean_fn,
+               policy_action_to_env_action_fn, render_cfg, image_history_len):
+    """[SPEED] The episode loop, moved unchanged out of _evaluate_seed_values so it can be jitted once."""
+    use_images = render_cfg is not None  # [IMG] static
+    batch_size = int(state.robot_state.shape[0])
+ 
     init_done = jnp.zeros((batch_size,), dtype=bool)
     init_returns = jnp.zeros((batch_size,), dtype=jnp.float32)
     init_success = jnp.zeros((batch_size,), dtype=bool)
@@ -124,7 +165,7 @@ def _evaluate_seed_values(
     init_key = jax.random.PRNGKey(0)
     max_steps = jnp.asarray(int(env_cfg.max_steps), dtype=jnp.int32)
     init_step = jnp.asarray(0, dtype=jnp.int32)
-
+ 
     def cond(carry):
         (
             _state,
@@ -141,7 +182,7 @@ def _evaluate_seed_values(
             step,
         ) = carry
         return (step < max_steps) & (~jnp.all(done))
-
+ 
     def body(carry):
         (
             curr_state,
@@ -163,7 +204,7 @@ def _evaluate_seed_values(
         policy_action = policy_action_mean_fn(params, hparams, policy_obs, **img_kw)  # [IMG]
         env_action = policy_action_to_env_action_fn(params, policy_action)
         next_state, reward, step_done, metrics = step_env(env_cfg, curr_state, env_action, step_key)
-
+ 
         active = ~done
         terminal = active & (step_done > 0.5)
         raw_collision = metrics["collision"] > 0.5
@@ -207,7 +248,7 @@ def _evaluate_seed_values(
             key,
             step + 1,
         )
-
+ 
     (
         _state,
         _history,
@@ -286,6 +327,12 @@ def evaluate_jax_env(
         policy_action_mean_fn = safe_action_mean_fn
 
     seed_values = _eval_seed_values(1 if episodes is None else episodes, seeds=seeds)
+    if policy_action_mean_fn is None or policy_action_to_env_action_fn is None:
+        raise ValueError("policy functions must be provided by the selected model")
+    # [SPEED] loop compiled once and reused; pass the same hparams/env_cfg objects each call to hit the cache
+    loop_fn = _cached_eval_loop(hparams, env_cfg, policy_action_mean_fn, policy_action_to_env_action_fn,
+                                render_cfg, image_history_len)  # [IMG] render settings are part of the key
+
     returns, success, collision, timeout, lengths, min_clearance = _evaluate_seed_values(
         params,
         hparams,
@@ -295,6 +342,7 @@ def evaluate_jax_env(
         policy_action_to_env_action_fn=policy_action_to_env_action_fn,
         render_cfg=render_cfg,  # [IMG]
         image_history_len=image_history_len,  # [IMG]
+        loop_fn=loop_fn,  # [SPEED]
     )
     returns_np = np.asarray(returns, dtype=np.float32)
     success_np = np.asarray(success, dtype=np.float32)

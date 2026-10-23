@@ -15,7 +15,7 @@ class RenderConfig(NamedTuple):
     goal_radius: float = 0.3     # metres
     goal_clip_to_border: bool = True  # egocentric: goal outside the window is drawn on the border (direction only)
     heading_tick: bool = True  # draw a tick mark on the robot to indicate heading | length = 1.6 * robot radius
-    tick_width_px: float = 1.0 # 2 px: robot centre sits on a pixel boundary, so 1 px splits into two ~50% columns
+    tick_width_px: float = 2.0 
 
 def render_config_from_omegaconf(node) -> RenderConfig:
     """Build from a dict-like config node (e.g. cfg.model.render). Missing keys use defaults."""
