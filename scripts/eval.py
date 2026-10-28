@@ -84,7 +84,7 @@ class Evaluator:
                 self.config.model.critic,
                 act_dim=int(self.config.env.act_dim),
             )
-            return self._cache["hparams"]
+        return self._cache["hparams"]
 
     def _env_cfg(self):
         if "env_cfg" not in self._cache:  # [SPEED] one object for all checkpoints (compile-cache key)
@@ -210,10 +210,11 @@ class Evaluator:
                 policy_action = model_module.policy_action_mean(params, hparams, policy_obs, **img_kw)
                 return model_module.policy_action_to_env_action(params, policy_action), {}
             qp_context = model_module.build_qp_context(policy_obs, hparams)
-            policy_action = model_module.safe_action_mean(params, hparams, policy_obs, qp_context=qp_context)
+            policy_action = model_module.safe_action_mean(params, hparams, policy_obs, qp_context=qp_context,
+                                                          **img_kw)  # [IMG] diff_cvar_cnn needs images too
             action, _logprob, _entropy, _value, diagnostics = model_module.get_action_and_value(
                 params, hparams, policy_obs, policy_action=policy_action,
-                return_diagnostics=True, qp_context=qp_context,
+                return_diagnostics=True, qp_context=qp_context, **img_kw,  # [IMG]
             )
             viz = {"qp_topk_ids": qp_context["qp_topk_ids"]}
             for name in ("r_safe", "beta", "alpha", "qp_slack", "qp_slack_max", "qp_correction"):
@@ -491,7 +492,7 @@ if __name__ == "__main__":
     parser.add_argument("--device", default="", choices=["", "cpu", "cuda", "auto"], help="Override device from config for eval/visualize")
     parser.add_argument("--seeds", default="", help="Comma-separated eval seeds; default is 100,200,...,1000")
     parser.add_argument("--episodes", type=int, default=50, help="Episodes per seed; default: 50")
-    parser.add_argument("--policy-view", action="store_true", help="[IMG] with --visualize: add the CNN input images (ppo_cnn) next to the arena view")
+    parser.add_argument("--policy-view", action="store_true", help="[IMG] with --visualize: add the CNN input images (ppo_cnn, diff_cvar_cnn) next to the arena view")
     parser.add_argument("--workers", type=int, default=None, help="[SPEED] processes drawing video frames in parallel (default: CPU count, max 8; 0 = off)")
     parser.add_argument("--vis-batch", type=int, default=16, help="[SPEED] episodes simulated together in one compiled --visualize rollout")
 

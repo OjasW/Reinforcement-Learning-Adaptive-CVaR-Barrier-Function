@@ -251,7 +251,7 @@ def compose_policy_view(arena_rgb, stack_u8):
 
     panel = Image.new("RGB", (panel_w, ha), "white")
     draw = ImageDraw.Draw(panel)
-    draw.text((pad, 8), "CNN input (what ppo_cnn sees)", fill="black", font=_font(18))
+    draw.text((pad, 8), "CNN input (what the policy sees)", fill="black", font=_font(18))
     for i in range(t_len):
         r, c = divmod(i, cols)
         x0 = pad + c * (tile + pad)

@@ -10,7 +10,7 @@ obs_dim: ${mul:${model.history_len},${model.obs_frame_dim}}
 image_history_len: 4          # latest 3 or 4 frames, stacked on channels -> 3 * 4 = 12 input channels
 render:
   image_size: 84              # H = W
-  half_extent: 7.0            # metres from centre to edge -> 0.167 m/px
+  half_extent: 4.0            # metres from centre to edge 
   view: egocentric            # robot centred, heading up
   goal_radius: 0.3
   goal_clip_to_border: true

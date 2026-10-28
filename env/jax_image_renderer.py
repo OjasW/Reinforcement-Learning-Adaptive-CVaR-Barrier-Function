@@ -10,7 +10,7 @@ NUM_CHANNELS = 3
 
 class RenderConfig(NamedTuple):
     image_size: int = 84        # H = W, pixels
-    half_extent: float = 7.0    # metres from image center to edge (84 px --> 0.167 m/px)
+    half_extent: float = 4.0    # metres from image center to edge 
     view: str = "egocentric"    # "egocentric" = robot centred, heading up | "world" = arena centered, +y up
     goal_radius: float = 0.3     # metres
     goal_clip_to_border: bool = True  # egocentric: goal outside the window is drawn on the border (direction only)
