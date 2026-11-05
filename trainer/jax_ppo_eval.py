@@ -87,6 +87,25 @@ def _policy_obs_frame_from_state(env_cfg, state, hparams):
     return fixed_order_policy_obs_from_state(env_cfg, state)
 
 
+# [SPEED] Compiled-loop cache: one jitted episode loop per (hparams, env_cfg, policy fns).
+_EVAL_FN_CACHE = {}
+
+
+def _cached_eval_loop(hparams, env_cfg, policy_action_mean_fn, policy_action_to_env_action_fn):
+    cache_key = (id(hparams), id(env_cfg), policy_action_mean_fn, policy_action_to_env_action_fn)
+    entry = _EVAL_FN_CACHE.get(cache_key)
+    # identity check guards against a reused id() after garbage collection (the entry also keeps both alive)
+    if entry is None or entry[0] is not hparams or entry[1] is not env_cfg:
+        fn = jax.jit(
+            lambda params, state, history: _eval_loop(
+                params, hparams, env_cfg, state, history, policy_action_mean_fn, policy_action_to_env_action_fn,
+            )
+        )
+        entry = (hparams, env_cfg, fn)
+        _EVAL_FN_CACHE[cache_key] = entry
+    return entry[2]
+
+
 def _evaluate_seed_values(
     params,
     hparams,
@@ -94,6 +113,7 @@ def _evaluate_seed_values(
     seed_values,
     policy_action_mean_fn=None,
     policy_action_to_env_action_fn=None,
+    loop_fn=None,  # [SPEED] cached compiled episode loop from _cached_eval_loop (None = build it here)
 ):
     """Evaluate all requested episodes as one batched JAX env rollout."""
     if policy_action_mean_fn is None or policy_action_to_env_action_fn is None:
@@ -101,9 +121,21 @@ def _evaluate_seed_values(
 
     keys = jnp.stack([jax.random.PRNGKey(int(seed)) for seed in seed_values], axis=0)
     state = reset_env_with_keys(env_cfg, keys)
-    batch_size = int(seed_values.shape[0])
     frame = _policy_obs_frame_from_state(env_cfg, state, hparams)
     history = jnp.repeat(frame[:, None, :], int(hparams.history_len), axis=1)
+
+    # [SPEED] reset + first frames run exactly as before (eager), so episodes start from bit-identical states;
+    # only the episode loop below is compiled once and reused.
+    if loop_fn is None:
+        loop_fn = lambda p, st, h: _eval_loop(
+            p, hparams, env_cfg, st, h, policy_action_mean_fn, policy_action_to_env_action_fn,
+        )
+    return loop_fn(params, state, history)
+
+
+def _eval_loop(params, hparams, env_cfg, state, history, policy_action_mean_fn, policy_action_to_env_action_fn):
+    """[SPEED] The episode loop, moved unchanged out of _evaluate_seed_values so it can be jitted once."""
+    batch_size = int(state.robot_state.shape[0])
 
     init_done = jnp.zeros((batch_size,), dtype=bool)
     init_returns = jnp.zeros((batch_size,), dtype=jnp.float32)
@@ -261,6 +293,11 @@ def evaluate_jax_env(
         policy_action_mean_fn = safe_action_mean_fn
 
     seed_values = _eval_seed_values(1 if episodes is None else episodes, seeds=seeds)
+    if policy_action_mean_fn is None or policy_action_to_env_action_fn is None:
+        raise ValueError("policy functions must be provided by the selected model")
+    # [SPEED] loop compiled once and reused; pass the same hparams/env_cfg objects each call to hit the cache
+    loop_fn = _cached_eval_loop(hparams, env_cfg, policy_action_mean_fn, policy_action_to_env_action_fn)
+
     returns, success, collision, timeout, lengths, min_clearance = _evaluate_seed_values(
         params,
         hparams,
@@ -268,6 +305,7 @@ def evaluate_jax_env(
         seed_values,
         policy_action_mean_fn=policy_action_mean_fn,
         policy_action_to_env_action_fn=policy_action_to_env_action_fn,
+        loop_fn=loop_fn,  # [SPEED]
     )
     returns_np = np.asarray(returns, dtype=np.float32)
     success_np = np.asarray(success, dtype=np.float32)

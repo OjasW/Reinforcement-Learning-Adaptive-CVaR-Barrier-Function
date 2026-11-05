@@ -5,7 +5,9 @@ from importlib import import_module
 
 _JAX_MODEL_MODULES = {
     "diff_cvar_mlp": "model.jax_diff_cvar_mlp",
+    "diff_cvar_gnn": "model.jax_diff_cvar_gnn",
     "ppo_mlp": "model.jax_ppo_mlp",
+    "ppo_gnn": "model.jax_ppo_gnn",
 }
 
 
