@@ -17,6 +17,11 @@ import wandb
 
 from env.jax_robot import normalize_robot_type
 from env.jax_social_nav import config_from_omegaconf, reset_env
+from env.jax_image_renderer import (  # [IMG] renderer config + initial image history
+    init_image_history,
+    render_config_from_omegaconf,
+    render_policy_frame,
+)
 from model import get_jax_model_module
 from trainer.jax_checkpoint import save_jax_checkpoint
 from trainer.jax_platform import (
@@ -384,6 +389,10 @@ class JaxTrainerBase:
         if "qp_obs" in batch and "qp_topk_ids" in batch:
             update_batch["qp_obs"] = jnp.asarray(batch["qp_obs"], dtype=jnp.float32)
             update_batch["qp_topk_ids"] = jnp.asarray(batch["qp_topk_ids"], dtype=jnp.int32)
+        # [IMG] keep the image history for the PPO update. Leave it uint8 (4x smaller than float32);
+        # the model converts it with env.jax_image_renderer.history_to_cnn_input.
+        if "img" in batch:
+            update_batch["img"] = batch["img"]
         return update_batch
 
     @staticmethod
@@ -647,6 +656,8 @@ class JaxTrainerBase:
             episodes=episodes,
             policy_action_mean_fn=self.model_module.policy_action_mean,
             policy_action_to_env_action_fn=self.model_module.policy_action_to_env_action,
+            render_cfg=self.render_cfg,  # [IMG] None for MLP/GNN -> eval is unchanged
+            image_history_len=self.image_history_len,  # [IMG]
         )
 
     @staticmethod
@@ -670,7 +681,13 @@ class JaxTrainerBase:
         env_state = reset_env(self.jax_env_cfg, reset_key, self.num_envs)
         env_history = init_obs_history(self.jax_env_cfg, env_state, self.history_len)
         ppo_episode_returns = jnp.zeros((self.num_envs,), dtype=jnp.float32)
-        env_state = (env_state, env_history, ppo_episode_returns)
+        # [IMG] image models carry an extra image history; must match the tuple make_rollout_collector unpacks
+        if self.render_cfg is not None:
+            first_image = render_policy_frame(self.jax_env_cfg, env_state, self.render_cfg)
+            image_history = init_image_history(first_image, self.image_history_len)
+            env_state = (env_state, env_history, image_history, ppo_episode_returns)
+        else:
+            env_state = (env_state, env_history, ppo_episode_returns)
         self._replace_train_state(env_state=env_state, global_step=0)
         start_time = time.time()
         global_step = int(self.train_state.global_step)
@@ -783,9 +800,15 @@ class JaxPPOBaseTrainer(JaxTrainerBase):
 
     def __init__(self, config):
         self.model_module = get_jax_model_module(config.model)
+        # [IMG] images are on only if the model config has a `render:` block (e.g. config/model/ppo_cnn.yaml).
+        # image_history_len is separate from history_len: history_len also sets the qp_obs / obs_dim shapes.
+        render_node = config.model.get("render", None)
+        self.render_cfg = render_config_from_omegaconf(render_node) if render_node is not None else None
+        self.image_history_len = int(config.model.get("image_history_len", 4))
         self.rollout_collector = make_rollout_collector(
             self.model_module,
             use_qp=hasattr(self.model_module, "build_qp_context"),
+            render_cfg=self.render_cfg,  # [IMG]
         )
         super().__init__(config)
         self.total_updates = max(1, int(np.ceil(self.total_timesteps / max(self.timesteps_per_batch, 1))))
