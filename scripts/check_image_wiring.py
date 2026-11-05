@@ -33,7 +33,7 @@ def ok(name, cond, extra=""):
 
 def load_original(relpath, modname):
     """Load the unmodified HEAD version of a repo file, for regression comparison."""
-    src = subprocess.check_output(["git", "show", f"HEAD:{relpath}"], text=True)
+    src = subprocess.check_output(["git", "show", f"origin/gnn-jax:{relpath}"], text=True)
     spec = importlib.util.spec_from_loader(modname, loader=None)
     mod = importlib.util.module_from_spec(spec)
     exec(compile(src, f"HEAD:{relpath}", "exec"), mod.__dict__)
