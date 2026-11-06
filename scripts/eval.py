@@ -210,10 +210,11 @@ class Evaluator:
                 policy_action = model_module.policy_action_mean(params, hparams, policy_obs, **img_kw)
                 return model_module.policy_action_to_env_action(params, policy_action), {}
             qp_context = model_module.build_qp_context(policy_obs, hparams)
-            policy_action = model_module.safe_action_mean(params, hparams, policy_obs, qp_context=qp_context)
+            policy_action = model_module.safe_action_mean(params, hparams, policy_obs, qp_context=qp_context,
+                                                          **img_kw)  # [IMG] CNN + QP models need images too
             action, _logprob, _entropy, _value, diagnostics = model_module.get_action_and_value(
                 params, hparams, policy_obs, policy_action=policy_action,
-                return_diagnostics=True, qp_context=qp_context,
+                return_diagnostics=True, qp_context=qp_context, **img_kw,  # [IMG]
             )
             viz = {"qp_topk_ids": qp_context["qp_topk_ids"]}
             for name in ("r_safe", "beta", "alpha", "qp_slack", "qp_slack_max", "qp_correction"):
