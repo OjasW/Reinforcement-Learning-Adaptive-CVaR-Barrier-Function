@@ -84,7 +84,7 @@ class Evaluator:
                 self.config.model.critic,
                 act_dim=int(self.config.env.act_dim),
             )
-            return self._cache["hparams"]
+        return self._cache["hparams"] 
 
     def _env_cfg(self):
         if "env_cfg" not in self._cache:  # [SPEED] one object for all checkpoints (compile-cache key)

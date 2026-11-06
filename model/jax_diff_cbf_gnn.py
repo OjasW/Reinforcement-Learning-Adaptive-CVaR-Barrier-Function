@@ -1,4 +1,4 @@
-"""JAX diff-CVaR actor with a shared GNN encoder"""
+"""JAX diff- cbfactor with a shared GNN encoder"""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ import jax.numpy as jnp
 
 from env.jax_robot import normalize_robot_type
 from model import jax_actor_critic as actor_critic
-from model import jax_cvar_qp
+from model import jax_cbf_qp
 from model.jax_graph import _graph_
 from model.jax_gat import _init_gat_params, gat_encode
 from model.jax_ppo_base import (
@@ -27,20 +27,17 @@ from model.jax_ppo_base import (
 HUMAN_EDGE_DIM = 5 # [dx, dy, vx, vy, radius] in robot frame # Change 1
 
 @dataclass(frozen=True)
-class DiffCVaRGNNHParams:
+class DiffCBFGNNHParams:
     act_dim: int
     robot_type: str
     actor_act: str
     critic_act: str
     margin_base: float
-    margin_extra_max: float
-    alpha: float
-    beta_min: float
-    beta_max: float
-    learn_beta: bool
-    learn_r_safe: bool
+    kappa_min:float
+    kappa_max: float
+    kappa_init: float
+    learn_kappa: bool
     lookahead_distance: float
-    gmm_lateral_ratio: float
     qp_max_iter: int
     qp_eps: float
     qp_not_improved_lim: int
@@ -65,50 +62,47 @@ def hparams_from_config(model_cfg, critic_cfg, act_dim=2):
     actor_cfg = model_cfg.actor
     if cfg_get(actor_cfg, "qp_solver", "jax_qpth") != "jax_qpth":
         raise ValueError("this branch supports only model.actor.qp_solver=jax_qpth")
-    require_config_value(model_cfg, "type", "diff_cvar_gnn", "model")
-    require_config_value(
-        actor_cfg, "coordinate_frame", "robot_body", "model.actor"
-    )
+    require_config_value(model_cfg, "type", "diff_cbf_gnn", "model")
+    require_config_value(actor_cfg, "coordinate_frame", "robot_body", "model.actor")
 
     history_len = int(model_cfg.history_len)
     obs_frame_dim = int(model_cfg.obs_frame_dim)
     obs_dim = int(model_cfg.obs_dim)
     if history_len <= 0:
-        raise ValueError("diff_cvar_gnn requires history_len > 0")
+        raise ValueError("diff_cbf_gnn requires history_len > 0")
     if obs_frame_dim < 6 or (obs_frame_dim - 6) % 6 != 0:
         raise ValueError(
-            "diff_cvar_gnn requires obs_frame_dim = 6 + num_humans * 6"
+            "diff_cbf_gnn requires obs_frame_dim = 6 + num_humans * 6"
         )
     if obs_dim != history_len * obs_frame_dim:
         raise ValueError(
-            "diff_cvar_gnn requires obs_dim = history_len * obs_frame_dim"
+            "diff_cbf_gnn requires obs_dim = history_len * obs_frame_dim"
         )
     if int(act_dim) != 2:
-        raise ValueError("diff_cvar_gnn requires act_dim=2")
+        raise ValueError("diff_cbf_gnn requires act_dim=2")
 
     num_humans = (obs_frame_dim - 6) // 6
     qp_obs_top_k = min(
         int(cfg_get(actor_cfg, "qp_obs_top_k", 5)), num_humans
     )
     if qp_obs_top_k <= 0:
-        raise ValueError("diff_cvar_gnn requires qp_obs_top_k > 0")
+        raise ValueError("diff_cbf_gnn requires qp_obs_top_k > 0")
 
-    beta_min = float(cfg_get(actor_cfg, "beta_min", 0.05))
-    beta_max = float(actor_cfg.beta)
-    if not (0.0 < beta_min < beta_max < 1.0):
-        raise ValueError("diff_cvar_gnn requires 0 < beta_min < beta < 1")
-    if qp_obs_top_k * beta_min > beta_max:
+    kappa_min = float(actor_cfg.kappa_min)
+    kappa_max = float(actor_cfg.kappa_max)
+    kappa_init = float(cfg_get(actor_cfg, "kappa_init", 0.5 * (kappa_min + kappa_max)))
+    
+    if not (0.0 < kappa_min < kappa_max):
+        raise ValueError("diff_cbf_gnn requires 0 < kappa_min < kappa_max")
+    if not (kappa_min < kappa_init < kappa_max):
         raise ValueError(
-            "diff_cvar_gnn requires qp_obs_top_k * beta_min <= beta"
+            "diff_cbf_gnn requires kappa_min < kappa_init < kappa_max"
         )
 
     margin_base = float(actor_cfg.margin_base)
-    margin_extra_max = float(actor_cfg.margin_extra_max)
     if margin_base < 0.0:
         raise ValueError("model.actor.margin_base must be >= 0")
-    if margin_extra_max < 0.0:
-        raise ValueError("model.actor.margin_extra_max must be >= 0")
-
+    
     gnn_hidden_dim = int(cfg_get(actor_cfg, "gnn_hidden_dim", 64))
     gnn_latent_dim = int(cfg_get(actor_cfg, "gnn_latent_dim", 16))
     gnn_layers = int(cfg_get(actor_cfg, "gnn_layers", 3))
@@ -116,14 +110,14 @@ def hparams_from_config(model_cfg, critic_cfg, act_dim=2):
     velocity_scale = float(cfg_get(actor_cfg, "velocity_scale", 1.0))
     if gnn_hidden_dim <= 0 or gnn_latent_dim <= 0 or gnn_layers <= 0:
         raise ValueError(
-            "diff_cvar_gnn encoder dimensions and layer count must be > 0"
+            "diff_cbf_gnn encoder dimensions and layer count must be > 0"
         )
     if position_scale <= 0.0 or velocity_scale <= 0.0:
         raise ValueError(
-            "diff_cvar_gnn position_scale and velocity_scale must be > 0"
+            "diff_cbf_gnn position_scale and velocity_scale must be > 0"
         )
 
-    return DiffCVaRGNNHParams(
+    return DiffCBFGNNHParams(
         act_dim=int(act_dim),
         robot_type=normalize_robot_type(
             cfg_get(model_cfg, "robot_type", "unicycle")
@@ -131,16 +125,13 @@ def hparams_from_config(model_cfg, critic_cfg, act_dim=2):
         actor_act=str(cfg_get(actor_cfg, "act", "relu")),
         critic_act=str(cfg_get(critic_cfg, "act", "relu")),
         margin_base=margin_base,
-        margin_extra_max=margin_extra_max,
-        alpha=float(actor_cfg.alpha),
-        beta_min=beta_min,
-        beta_max=beta_max,
-        learn_beta=bool(cfg_get(actor_cfg, "learn_beta", True)),
-        learn_r_safe=bool(cfg_get(actor_cfg, "learn_r_safe", True)),
+        kappa_min=kappa_min,
+        kappa_max=kappa_max,
+        kappa_init=kappa_init,
+        learn_kappa=bool(cfg_get(actor_cfg, "learn_kappa", True)),
         lookahead_distance=float(
             cfg_get(actor_cfg, "lookahead_distance", 0.2)
         ),
-        gmm_lateral_ratio=float(actor_cfg.gmm_lateral_ratio),
         qp_max_iter=int(cfg_get(actor_cfg, "qp_max_iter", 40)),
         qp_eps=float(cfg_get(actor_cfg, "qp_eps", 1e-12)),
         qp_not_improved_lim=int(
@@ -164,6 +155,11 @@ def hparams_from_config(model_cfg, critic_cfg, act_dim=2):
         velocity_scale=velocity_scale,
         qp_obs_top_k=qp_obs_top_k,
     )
+
+def _kappa_logit(hparams):
+    """Logit xi with kappa_min + (kappa_max - kappa_min) * sigmoid(xi) = kappa_init """
+    frac = (hparams.kappa_init - hparams.kappa_min) / (hparams.kappa_max - hparams.kappa_min)
+    return math.log(frac/ (1.0-frac))
 
 
 def init_params_from_config(
@@ -194,12 +190,11 @@ def init_params_from_config(
         critic_hidden_dim2,
     ) <= 0:
         raise ValueError(
-            "diff_cvar_gnn actor and critic hidden dimensions must be > 0"
+            "diff_cbf_gnn actor and critic hidden dimensions must be > 0"
         )
 
     gat_keys, key = jax.random.split(key) 
-    keys = jax.random.split(key, 9) # fc1, nominal_head x2, human_fc1, human_beta_head, human_rsafe_head, critic x3
-    gnn_end = 0
+    keys = jax.random.split(key, 8) # fc1, nominal_head x2, human_fc1, human_kappa_head, critic x3
     sqrt2 = math.sqrt(2.0)
     actor = {
         "logstd": jnp.full(
@@ -211,70 +206,56 @@ def init_params_from_config(
             gat_keys, 4, 7, hparams.gnn_hidden_dim, hparams.gnn_latent_dim, hparams.gnn_layers, use_init_weights
         ),
         "fc1": init_linear(
-            keys[gnn_end],
+            keys[0],
             hparams.gnn_latent_dim,
             hidden_dim,
             sqrt2,
             use_init_weights,
         ),
         "nominal_head": init_head(
-            keys[gnn_end + 1 : gnn_end + 3],
+            keys[1 : 3],
             hidden_dim,
             control_hidden_dim,
             act_dim,
             use_init_weights,
         ),
     }
-    if hparams.learn_beta or hparams.learn_r_safe:
+    if hparams.learn_kappa:
         actor["human_fc1"] = init_linear(
-            keys[gnn_end + 3],
+            keys[3],
             hparams.gnn_latent_dim + hparams.gnn_hidden_dim + HUMAN_EDGE_DIM, # Change 2
             scalar_hidden_dim,
             sqrt2,
             use_init_weights,
         )
-    if hparams.learn_beta:
-        actor["human_beta_head"] = init_linear(
-            keys[gnn_end + 4],
+        kappa_head = init_linear(
+            keys[4],
             scalar_hidden_dim,
-            1,     # hparams.num_humans, # Change 3
+            1, 
             sqrt2 * 0.01,
             use_init_weights,
         )
-    if hparams.learn_r_safe:
-        actor["human_rsafe_head"] = init_linear(
-            keys[gnn_end + 5],
-            scalar_hidden_dim,
-            1,    # hparams.num_humans, # Change 4
-            sqrt2 * 0.01,
-            use_init_weights,
-        )
-    actor.update({
-        "gmm_weights": jnp.asarray(
-            actor_cfg.gmm_weights, dtype=jnp.float32
-        ),
-        "gmm_variances": jnp.square(
-            jnp.asarray(actor_cfg.gmm_stds, dtype=jnp.float32)
-        ),
-    })
-
+        # bias, so kappa starts at kappa_init for every obstacle (small weights --> near constant start)
+        kappa_head["bias"] = jnp.full_like(kappa_head["bias"], _kappa_logit(hparams), dtype=jnp.float32)
+        actor["human_kappa_head"] = kappa_head
+    
     critic = {
         "fc1": init_linear(
-            keys[gnn_end + 6],
+            keys[5],
             hparams.gnn_latent_dim,
             critic_hidden_dim,
             sqrt2,
             use_init_weights,
         ),
         "fc21": init_linear(
-            keys[gnn_end + 7],
+            keys[6],
             critic_hidden_dim,
             critic_hidden_dim2,
             sqrt2,
             use_init_weights,
         ),
         "fc31": init_linear(
-            keys[gnn_end + 8],
+            keys[7],
             critic_hidden_dim2,
             1,
             1.0,
@@ -301,11 +282,11 @@ def _obs_history(obs, hparams):
     obs = jnp.asarray(obs, dtype=jnp.float32)
     if obs.ndim != 2:
         raise ValueError(
-            f"diff_cvar_gnn expects rank-2 observations, got ndim={obs.ndim}"
+            f"diff_cbf_gnn expects rank-2 observations, got ndim={obs.ndim}"
         )
     if obs.shape[-1] != hparams.obs_dim:
         raise ValueError(
-            f"diff_cvar_gnn expects obs_dim={hparams.obs_dim}, got {obs.shape[-1]}"
+            f"diff_cbf_gnn expects obs_dim={hparams.obs_dim}, got {obs.shape[-1]}"
         )
     return obs.reshape(
         (obs.shape[0], hparams.history_len, hparams.obs_frame_dim)
@@ -360,59 +341,6 @@ def _gather_topk(values, qp_topk_ids):
     return values[batch_idx, qp_topk_ids.astype(jnp.int32)]
 
 
-def _allocate_beta_budget(beta_logits, mask, hparams):
-    active = jnp.clip(mask, 0.0, 1.0) > 0.5
-    active_float = active.astype(beta_logits.dtype)
-    masked_logits = jnp.where(
-        active, beta_logits, jnp.asarray(-1e9, dtype=beta_logits.dtype)
-    )
-    weights = jnn.softmax(masked_logits, axis=-1) * active_float
-    weights = weights / jnp.maximum(
-        jnp.sum(weights, axis=-1, keepdims=True), 1e-8
-    )
-    valid_count = jnp.sum(active_float, axis=-1, keepdims=True)
-    remaining = jnp.maximum(
-        hparams.beta_max - hparams.beta_min * valid_count, 0.0
-    )
-    beta = hparams.beta_min + remaining * weights
-    return jnp.where(
-        active,
-        beta,
-        jnp.asarray(hparams.beta_min, dtype=beta_logits.dtype),
-    )
-
-
-def _uniform_beta_budget(mask, hparams):
-    active = jnp.clip(mask, 0.0, 1.0) > 0.5
-    dtype = mask.dtype
-    active_count = jnp.sum(active.astype(dtype), axis=-1, keepdims=True)
-    beta = jnp.asarray(hparams.beta_max, dtype=dtype) / jnp.maximum(
-        active_count, 1.0
-    )
-    return jnp.where(
-        active, beta, jnp.asarray(hparams.beta_min, dtype=dtype)
-    )
-
-
-def _safe_distances_from_margin_logits(current_obs, margin_logits, hparams):
-    batch_size = current_obs.shape[0]
-    blocks = current_obs[:, 6:].reshape(
-        (batch_size, hparams.num_humans, 6)
-    )
-    robot_radius = current_obs[:, 5:6]
-    human_radii = blocks[:, :, 4]
-    margin_base = jnp.asarray(
-        hparams.margin_base, dtype=current_obs.dtype
-    )
-    margin_extra_max = jnp.asarray(
-        hparams.margin_extra_max, dtype=current_obs.dtype
-    )
-    learned_margin = margin_base + margin_extra_max * jnn.sigmoid(
-        margin_logits
-    )
-    return robot_radius + human_radii + learned_margin
-
-
 def _fixed_safe_distances(current_obs, hparams):
     batch_size = current_obs.shape[0]
     blocks = current_obs[:, 6:].reshape(
@@ -443,8 +371,11 @@ def _encode_with_humans(params, hparams, obs):
     human_e = ea[:, sp0 : sp0 + n_h, :HUMAN_EDGE_DIM]                           # (B, N, 5)
     ctx = jnp.broadcast_to(latent[:, None, :], (latent.shape[0], n_h, latent.shape[-1]))
     return latent, jnp.concatenate([ctx, human_h, human_e], axis=-1)            # (B, N, L+H+5)
- 
-# Change 5
+
+
+def _kappa_from_logits(logits, hparams):
+    """kappa_i = kappa_min + (kappa_max - kappa_min) * sigmoid(logits_i)"""
+    return hparams.kappa_min + (hparams.kappa_max - hparams.kappa_min) * jnn.sigmoid(logits)
 
 
 def _actor_outputs(params, hparams, obs, qp_context=None):
@@ -458,53 +389,36 @@ def _actor_outputs(params, hparams, obs, qp_context=None):
         actor_params["nominal_head"], hidden, hparams.actor_act
     )
 
-    if hparams.learn_beta or hparams.learn_r_safe:
-        human_x = activation(
-            dense(actor_params["human_fc1"], human_in), hparams.actor_act
-        )
-    if hparams.learn_beta:
-        beta_logits_all = dense(actor_params["human_beta_head"], human_x)[..., 0]    # (B, N)
-    if hparams.learn_r_safe:
-        margin_logits_all = dense(actor_params["human_rsafe_head"], human_x)[..., 0] # (B, N)
-        r_safe_all = _safe_distances_from_margin_logits(
-            current_obs, margin_logits_all, hparams
-        )
-    else:
-        r_safe_all = _fixed_safe_distances(current_obs, hparams)
-
+    
     if qp_context is None:
         qp_context = build_qp_context(obs, hparams)
     qp_obs = qp_context["qp_obs"]
     qp_topk_ids = qp_context["qp_topk_ids"]
-    qp_blocks = qp_obs[:, 6:].reshape(
-        (qp_obs.shape[0], hparams.qp_obs_top_k, 6)
-    )
-    if hparams.learn_beta:
-        beta_logits_topk = _gather_topk(
-            beta_logits_all, qp_topk_ids
-        )
-        beta_topk = _allocate_beta_budget(
-            beta_logits_topk, qp_blocks[:, :, 5], hparams
-        )
+
+    # per-human kappa (B, N) -> gather the top-K rows that enter the QP
+    if hparams.learn_kappa:
+        human_x = activation(dense(actor_params["human_fc1"], human_in), hparams.actor_act)
+        kappa_logits_all = dense(actor_params["human_kappa_head"], human_x)[..., 0]  # (B, N)
+        kappa_topk = _kappa_from_logits(_gather_topk(kappa_logits_all, qp_topk_ids), hparams)
     else:
-        beta_topk = _uniform_beta_budget(
-            qp_blocks[:, :, 5], hparams
-        )
-    r_safe_topk = _gather_topk(r_safe_all, qp_topk_ids)
+        kappa_topk = jnp.full(qp_topk_ids.shape, hparams.kappa_init, dtype=jnp.float32)
+
+    # fixed safe distance R_i = r_robot + r_human + margin_base (no learned margin)
+    r_safe_topk = _gather_topk(_fixed_safe_distances(current_obs, hparams), qp_topk_ids)
     nominal_xy = _body_to_world(nominal_xy, qp_obs[:, 4])
-    safe_xy, slack = jax_cvar_qp.solve_slack_qp(
+    safe_xy, slack = jax_cbf_qp.solve_slack_qp(
         params,
         hparams,
         qp_obs,
         nominal_xy,
-        beta_topk,
+        kappa_topk,
         r_safe_topk,
     )
     return (
         latent,
         qp_obs,
         nominal_xy,
-        beta_topk,
+        kappa_topk,
         r_safe_topk,
         safe_xy,
         slack,
@@ -552,7 +466,7 @@ def get_action_and_value(
         latent,
         qp_obs,
         nominal_xy,
-        beta,
+        kappa,
         r_safe,
         safe_xy,
         slack,
@@ -571,27 +485,16 @@ def get_action_and_value(
     if return_policy_action:
         outputs = outputs + (sampled_policy_action,)
     if return_diagnostics:
-        if hparams.qp_full_diagnostics:
-            diagnostics = jax_cvar_qp.full_diagnostics(
-                params,
-                hparams,
-                qp_obs,
-                nominal_xy,
-                beta,
-                r_safe,
-                safe_xy,
-                slack,
-            )
-        else:
-            diagnostics = jax_cvar_qp.lightweight_diagnostics(
-                params,
-                hparams,
-                qp_obs,
-                nominal_xy,
-                beta,
-                r_safe,
-                safe_xy,
-                slack,
-            )
+        diag_fn = jax_cbf_qp.full_diagnostics if hparams.qp_full_diagnostics else jax_cbf_qp.lightweight_diagnostics
+        diagnostics = diag_fn(
+            params,
+            hparams,
+            qp_obs,
+            nominal_xy,
+            kappa,
+            r_safe,
+            safe_xy,
+            slack,
+        )        
         outputs = outputs + (diagnostics,)
     return outputs
