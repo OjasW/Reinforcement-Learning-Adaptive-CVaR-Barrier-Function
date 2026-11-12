@@ -97,6 +97,7 @@ class Evaluator:
     def _render_settings(self):
         """[IMG] (RenderConfig or None, image_history_len). Same rule as the trainer: images only if model.render exists."""
         if "render" not in self._cache:
+            self._configure_jax()  # [IMG] must run before jax_image_renderer imports jax, or x64 stays off
             render_node = self.config.model.get("render", None)
             if render_node is None:
                 self._cache["render"] = (None, 4)
