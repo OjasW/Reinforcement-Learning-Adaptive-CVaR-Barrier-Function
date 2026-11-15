@@ -146,6 +146,22 @@ def render_jax_social_nav_frame(
             continue
         ax.add_artist(Circle(pos, human_radii[i], facecolor=human_colors[i], edgecolor="none", linewidth=0.0, alpha=0.95, zorder=2))
 
+    # [LIDAR] estimated geometry: scan hits (dots) and the QP-selected estimates (dashed safety circles)
+    lidar_points = np.asarray(qp_viz.get("lidar_points", np.zeros((0, 2))), dtype=float).reshape(-1, 2)
+    lidar_valid = np.asarray(qp_viz.get("lidar_valid", np.zeros((0,), bool)), dtype=bool).reshape(-1)
+    if lidar_points.shape[0] and lidar_valid.shape[0] == lidar_points.shape[0]:
+        hits = lidar_points[lidar_valid]
+        ax.scatter(hits[:, 0], hits[:, 1], s=6, c="#0f766e", edgecolors="none", alpha=0.9, zorder=3)
+    est_xy = np.asarray(qp_viz.get("est_xy", np.zeros((0, 2))), dtype=float).reshape(-1, 2)
+    est_mask = np.asarray(qp_viz.get("est_mask", np.zeros((0,))), dtype=float).reshape(-1)
+    for j in range(min(est_xy.shape[0], est_mask.shape[0])):
+        if est_mask[j] < 0.5:
+            continue
+        r_j = float(r_safe[j]) - robot_radius if j < r_safe.shape[0] and np.isfinite(r_safe[j]) else 0.45
+        ax.add_artist(Circle(est_xy[j], max(r_j, 0.05), facecolor="none", edgecolor="#be185d", linewidth=1.3,
+                             linestyle="--", alpha=0.9, zorder=3.5))
+        ax.scatter([est_xy[j, 0]], [est_xy[j, 1]], s=14, c="#be185d", zorder=3.6)
+
     if robot_traj_arr.shape[0] > 1:
         points = robot_traj_arr.reshape(-1, 1, 2)
         segments = np.concatenate([points[:-1], points[1:]], axis=1)
@@ -187,6 +203,11 @@ def render_jax_social_nav_frame(
     goal_handle = Line2D([0], [0], marker="o", linestyle="None", markerfacecolor="#ead94c", markeredgecolor="#d2bc38", markeredgewidth=1.0, markersize=9, label="Goal")
     traj_handle = Line2D([0], [0], color=robot_color, linewidth=4.4, alpha=0.98, label="Trajectory")
     handles = [start_handle, goal_handle, traj_handle]
+    if lidar_points.shape[0]:  # [LIDAR]
+        handles.append(Line2D([0], [0], marker="o", linestyle="None", markerfacecolor="#0f766e", markeredgecolor="none",
+                              markersize=4, label="LiDAR hits"))
+    if est_mask.shape[0] and np.any(est_mask > 0.5):
+        handles.append(Line2D([0], [0], color="#be185d", linestyle="--", linewidth=1.3, label="QP estimates"))
     ax.legend(handles=handles, loc="upper right", frameon=True, fontsize=13, borderpad=0.3, handletextpad=0.4)
 
     ax.grid(False)

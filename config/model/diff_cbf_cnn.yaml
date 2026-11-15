@@ -18,6 +18,28 @@ render:
   heading_tick: true
   tick_width_px: 2.0
 
+geometry: ground_truth          # ground_truth | lidar | tracked_truth
+lidar:
+  num_beams: 360
+  fov: 6.283185307179586
+  max_range: 12.0
+  range_noise_std: 0.0
+  dropout_prob: 0.0
+  gap_base: 0.15
+  gap_scale: 3.0
+  max_clusters: 32
+  min_points: 1
+  fit_iters: 6
+  truth_noise_std: 0.02
+  perception_range: 4.0
+tracker:
+  gate: 1.0
+  max_coast: 3
+  min_hits: 1
+  accel_std: 3.0
+  meas_std: 0.05
+  init_vel_std: 1.5
+
 actor:
   # Policy network and exploration
   hidden_dim: 256

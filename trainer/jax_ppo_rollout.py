@@ -7,6 +7,7 @@ import jax.numpy as jnp
 
 from env.jax_social_nav import fixed_order_policy_obs_from_state, reset_env, step_env
 from env.jax_image_renderer import render_policy_frame, update_image_history  # [IMG] image renderer + image history
+from env import jax_tracker  # [LIDAR] estimated QP geometry (scan -> fit -> tracker)
 from trainer.jax_ppo_core import flat_time_batch
 
 
@@ -64,6 +65,18 @@ def _rollout_summary(transitions, use_qp, beta_budget=None):
         "robot_omega_delta_max": jnp.max(transitions["robot_omega_delta"]),
         "robot_omega_delta_penalty_mean": jnp.mean(transitions["robot_omega_delta_penalty"]),
     }
+    if "lidar_matched" in transitions:  # [LIDAR] perception errors vs ground truth (logging only)
+        matched = transitions["lidar_matched"]
+        summary.update({
+            "lidar_pos_err_sum": (transitions["lidar_pos_err"] * matched).sum(),
+            "lidar_pos_err_count": matched.sum(),
+            "lidar_vel_err_sum": (transitions["lidar_vel_err"] * matched).sum(),
+            "lidar_vel_err_count": matched.sum(),
+            "lidar_missed_sum": transitions["lidar_missed"].sum(),
+            "lidar_missed_count": jnp.asarray(transitions["lidar_missed"].size, dtype=jnp.float32),
+            "lidar_false_tracks_sum": transitions["lidar_false_tracks"].sum(),
+            "lidar_false_tracks_count": jnp.asarray(transitions["lidar_false_tracks"].size, dtype=jnp.float32),
+        })
     if use_qp:
         r_safe_sum, r_safe_count = _masked_topk_sum_count(
             transitions["r_safe"], transitions["qp_obs"]
@@ -158,16 +171,21 @@ def _update_ppo_episode_returns(running_returns, reward, done_bool):
     return next_returns.astype(jnp.float32), logged_returns.astype(jnp.float32)
 
 
-def make_rollout_collector(model_module, use_qp, render_cfg=None):
+def make_rollout_collector(model_module, use_qp, render_cfg=None, geometry=None):
     """Create a model-specific collector; ``use_qp`` and ``render_cfg`` are static before JIT tracing.
 
     [IMG] When ``render_cfg`` (an env.jax_render.RenderConfig) is given, the collector also keeps an
     image history and passes it to the model as ``image_obs``. env_state is then a 4-tuple
     (nav_state, obs_history, image_history, ppo_episode_returns) instead of the usual 3-tuple.
     The vector history is always kept: build_qp_context needs it for the CVaR-CBF QP.
+
+    [LIDAR] When ``geometry`` (env.jax_tracker.LidarGeometry) is given, the vector frames come from the
+    LiDAR tracker instead of the true human state, and env_state carries the tracker state before the returns:
+    (nav_state, obs_history, [image_history,] tracker_state, ppo_episode_returns).
     """
     use_qp = bool(use_qp)
     use_images = render_cfg is not None  # [IMG] static: MLP/GNN runs pass None and skip rendering
+    use_lidar = geometry is not None  # [LIDAR] static
 
     def collect(
         params,
@@ -179,17 +197,16 @@ def make_rollout_collector(model_module, use_qp, render_cfg=None):
         global_step=0,
     ):
         # [IMG] unpack the image history when images are on; None is an empty pytree, so lax.scan accepts it
-        if use_images:
-            nav_state, obs_history, image_history, ppo_episode_returns = env_state
-        else:
-            nav_state, obs_history, ppo_episode_returns = env_state
-            image_history = None
+        # [LIDAR] the tracker state sits right before the returns when geometry is on
+        nav_state, obs_history, ppo_episode_returns = env_state[0], env_state[1], env_state[-1]
+        image_history = env_state[2] if use_images else None
+        tracker_state = env_state[2 + int(use_images)] if use_lidar else None
 
         batch_size = int(nav_state.robot_state.shape[0])
         act_dim = int(hparams.act_dim)
 
         def body(carry, _unused):
-            state, history, img_hist, running_ppo_returns, key = carry  # [IMG] img_hist added to the carry
+            state, history, img_hist, tracker, running_ppo_returns, key = carry  # [IMG] img_hist, [LIDAR] tracker
             key, noise_key, env_key, reset_key = jax.random.split(key, 4)
             policy_obs = history.reshape((batch_size, -1))
             noise = jax.random.normal(noise_key, (batch_size, act_dim), dtype=jnp.float32)
@@ -228,7 +245,16 @@ def make_rollout_collector(model_module, use_qp, render_cfg=None):
                 done_bool,
             )
             next_state = _maybe_reset_done_envs(env_cfg, next_state, reset_key, done_bool, batch_size)
-            next_frame = fixed_order_policy_obs_from_state(env_cfg, next_state)
+            if use_lidar:  # [LIDAR] scan the post-reset state; done_bool clears the tracks of new episodes
+                next_frame, next_tracker = jax_tracker.lidar_frame_step(
+                    env_cfg, geometry, tracker, next_state, reset_key, done_bool
+                )
+                perception = jax_tracker.perception_metrics(
+                    next_state, next_tracker, geometry.tracker, near_range=geometry.perception_range
+                )
+            else:
+                next_frame = fixed_order_policy_obs_from_state(env_cfg, next_state)
+                next_tracker = None
             next_history = _update_obs_history(history, next_frame, done_bool)
             # [IMG] render AFTER the reset (same place as next_frame), so a finished env gets the first frame of
             # its new episode, and done_bool overwrites its whole image history, exactly like the vector history.
@@ -297,12 +323,20 @@ def make_rollout_collector(model_module, use_qp, render_cfg=None):
                 }
             if use_images:
                 transition["img"] = img_hist  # [IMG] the image history the action was chosen from (same step as "obs")
-            return (next_state, next_history, next_img_hist, next_ppo_returns, key), transition  # [IMG] carry
+            if use_lidar:  # [LIDAR] logging only; never part of the update batch
+                transition.update({
+                    "lidar_pos_err": perception["pos_err"],
+                    "lidar_vel_err": perception["vel_err"],
+                    "lidar_matched": perception["num_matched"],
+                    "lidar_missed": perception["missed"],
+                    "lidar_false_tracks": perception["false_tracks"],
+                })
+            return (next_state, next_history, next_img_hist, next_tracker, next_ppo_returns, key), transition
 
         # [IMG] image history added to both the scan output and the initial carry
-        (next_state, next_history, next_img_hist, next_ppo_returns, next_rng), transitions = jax.lax.scan(
+        (next_state, next_history, next_img_hist, next_tracker, next_ppo_returns, next_rng), transitions = jax.lax.scan(
             body,
-            (nav_state, obs_history, image_history, ppo_episode_returns, rng),
+            (nav_state, obs_history, image_history, tracker_state, ppo_episode_returns, rng),
             None,
             length=int(steps_per_env),
         )
@@ -346,9 +380,12 @@ def make_rollout_collector(model_module, use_qp, render_cfg=None):
         # [IMG] images go into the batch as uint8 (B*steps, T, H, W, 3); the model converts them to float
         if use_images:
             batch["img"] = flat_time_batch(transitions["img"])
-            next_env_state = (next_state, next_history, next_img_hist, next_ppo_returns)
-        else:
-            next_env_state = (next_state, next_history, next_ppo_returns)
+        next_env_state = (
+            (next_state, next_history)
+            + ((next_img_hist,) if use_images else ())
+            + ((next_tracker,) if use_lidar else ())  # [LIDAR]
+            + (next_ppo_returns,)
+        )
         return batch, next_env_state, next_rng  # [IMG] 4-tuple env_state when images are on
 
     return collect

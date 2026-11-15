@@ -13,6 +13,7 @@ from env.jax_social_nav import (
     step_env,
 )
 from env.jax_image_renderer import init_image_history, render_policy_frame  # [IMG]
+from env import jax_tracker  # [LIDAR]
 
 
 DEFAULT_EVAL_SEEDS = tuple(range(100, 1001, 100))
@@ -95,16 +96,17 @@ def _seed_keys(seed_values):
 _EVAL_FN_CACHE = {}
 
 def _cached_eval_loop(hparams, env_cfg, policy_action_mean_fn, policy_action_to_env_action_fn,
-                      render_cfg, image_history_len):
+                      render_cfg, image_history_len, geometry=None):
     cache_key = (id(hparams), id(env_cfg), policy_action_mean_fn, policy_action_to_env_action_fn,
-                 render_cfg, int(image_history_len))
+                 render_cfg, int(image_history_len), geometry)  # [LIDAR] geometry is a hashable NamedTuple
     entry = _EVAL_FN_CACHE.get(cache_key)
     # identity check guards against a reused id() after garbage collection (the entry also keeps both alive)
     if entry is None or entry[0] is not hparams or entry[1] is not env_cfg:
         fn = jax.jit(
-            lambda params, state, history, img_history: _eval_loop(
+            lambda params, state, history, img_history, tracker: _eval_loop(
                 params, hparams, env_cfg, state, history, img_history,
                 policy_action_mean_fn, policy_action_to_env_action_fn, render_cfg, image_history_len,
+                tracker=tracker, geometry=geometry,
             )
         )
         entry = (hparams, env_cfg, fn)
@@ -122,6 +124,7 @@ def _evaluate_seed_values(
     image_history_len=4,  # [IMG]
     keys=None,  # [SPEED] precomputed reset keys
     loop_fn=None,  # [SPEED] cached compiled episode loop from _cached_eval_loop (None = build it here)
+    geometry=None,  # [LIDAR] env.jax_tracker.LidarGeometry; None = ground-truth QP geometry
 ):
     """Evaluate all requested episodes as one batched JAX env rollout."""
     use_images = render_cfg is not None  # [IMG] static
@@ -132,8 +135,14 @@ def _evaluate_seed_values(
         keys = _seed_keys(seed_values)
     state = reset_env_with_keys(env_cfg, keys)
     batch_size = int(keys.shape[0])
-    frame = _policy_obs_frame_from_state(env_cfg, state, hparams)
-    history = jnp.repeat(frame[:, None, :], int(hparams.history_len), axis=1)
+    if geometry is not None:  # [LIDAR] first frame from the tracker
+        history, tracker = jax_tracker.init_lidar_obs_history(
+            env_cfg, geometry, state, int(hparams.history_len), jax.random.PRNGKey(0)
+        )
+    else:
+        frame = _policy_obs_frame_from_state(env_cfg, state, hparams)
+        history = jnp.repeat(frame[:, None, :], int(hparams.history_len), axis=1)
+        tracker = None
     # [IMG] initial image history = first frame repeated (None when images are off)
     img_history = (
         init_image_history(render_policy_frame(env_cfg, state, render_cfg), image_history_len)
@@ -143,17 +152,27 @@ def _evaluate_seed_values(
     # [SPEED] reset + first frames run exactly as before (eager), so episodes start from bit-identical states;
     # only the episode loop below is compiled once and reused.
     if loop_fn is None:
-        loop_fn = lambda p, st, h, ih: _eval_loop(
+        loop_fn = lambda p, st, h, ih, tr: _eval_loop(
             p, hparams, env_cfg, st, h, ih, policy_action_mean_fn, policy_action_to_env_action_fn,
-            render_cfg, image_history_len,
+            render_cfg, image_history_len, tracker=tr, geometry=geometry,
         )
-    return loop_fn(params, state, history, img_history)
+    return loop_fn(params, state, history, img_history, tracker)
 
 def _eval_loop(params, hparams, env_cfg, state, history, img_history, policy_action_mean_fn,
-               policy_action_to_env_action_fn, render_cfg, image_history_len):
-    """[SPEED] The episode loop, moved unchanged out of _evaluate_seed_values so it can be jitted once."""
+               policy_action_to_env_action_fn, render_cfg, image_history_len, tracker=None, geometry=None):
+    """[SPEED] The episode loop, moved unchanged out of _evaluate_seed_values so it can be jitted once.
+
+    [LIDAR] With geometry, frames come from the tracker (carried in `tracker`) and perception errors are
+    accumulated per episode for the report; they never reach the policy or the QP.
+    """
     use_images = render_cfg is not None  # [IMG] static
+    use_lidar = geometry is not None  # [LIDAR] static
     batch_size = int(state.robot_state.shape[0])
+    zeros_b = jnp.zeros((batch_size,), dtype=jnp.float32)
+    init_perception = (
+        {name: zeros_b for name in ("pos_err_sum", "vel_err_sum", "matched", "missed", "false_tracks", "steps")}
+        if use_lidar else None
+    )
  
     init_done = jnp.zeros((batch_size,), dtype=bool)
     init_returns = jnp.zeros((batch_size,), dtype=jnp.float32)
@@ -171,6 +190,8 @@ def _eval_loop(params, hparams, env_cfg, state, history, img_history, policy_act
             _state,
             _history,
             _img_history,  # [IMG]
+            _tracker,  # [LIDAR]
+            _perception,
             done,
             _returns,
             _success,
@@ -188,6 +209,8 @@ def _eval_loop(params, hparams, env_cfg, state, history, img_history, policy_act
             curr_state,
             curr_history,
             curr_img_history,  # [IMG]
+            curr_tracker,  # [LIDAR]
+            perception,
             done,
             returns,
             success,
@@ -223,7 +246,26 @@ def _eval_loop(params, hparams, env_cfg, state, history, img_history, policy_act
             jnp.where(active, metrics["min_clearance"], jnp.inf),
         )
         selected_state = _select_tree_by_active(active, curr_state, next_state)
-        next_frame = _policy_obs_frame_from_state(env_cfg, selected_state, hparams)
+        if use_lidar:  # [LIDAR] scan + track while the episode runs; freeze the tracker once it has ended
+            next_frame, stepped_tracker = jax_tracker.lidar_frame_step(
+                env_cfg, geometry, curr_tracker, selected_state, step_key, jnp.zeros((batch_size,), dtype=bool)
+            )
+            next_tracker = _select_tree_by_active(active, curr_tracker, stepped_tracker)
+            pm = jax_tracker.perception_metrics(
+                selected_state, stepped_tracker, geometry.tracker, near_range=geometry.perception_range
+            )
+            a = active.astype(jnp.float32)
+            perception = {
+                "pos_err_sum": perception["pos_err_sum"] + a * pm["pos_err"] * pm["num_matched"],
+                "vel_err_sum": perception["vel_err_sum"] + a * pm["vel_err"] * pm["num_matched"],
+                "matched": perception["matched"] + a * pm["num_matched"],
+                "missed": perception["missed"] + a * pm["missed"],
+                "false_tracks": perception["false_tracks"] + a * pm["false_tracks"],
+                "steps": perception["steps"] + a,
+            }
+        else:
+            next_frame = _policy_obs_frame_from_state(env_cfg, selected_state, hparams)
+            next_tracker = None
         shifted_history = jnp.concatenate([curr_history[:, 1:, :], next_frame[:, None, :]], axis=1)
         next_history = jnp.where(active[:, None, None], shifted_history, curr_history)
         # [IMG] same rule as the vector history above: shift in a new image while the episode is running,
@@ -238,6 +280,8 @@ def _eval_loop(params, hparams, env_cfg, state, history, img_history, policy_act
             selected_state,
             next_history,
             next_img_history,  # [IMG]
+            next_tracker,  # [LIDAR]
+            perception,
             next_done,
             returns,
             success,
@@ -253,6 +297,8 @@ def _eval_loop(params, hparams, env_cfg, state, history, img_history, policy_act
         _state,
         _history,
         _img_history,  # [IMG]
+        _tracker,  # [LIDAR]
+        perception,
         done,
         returns,
         success,
@@ -269,6 +315,8 @@ def _eval_loop(params, hparams, env_cfg, state, history, img_history, policy_act
             state,
             history,
             img_history,  # [IMG]
+            tracker,  # [LIDAR]
+            init_perception,
             init_done,
             init_returns,
             init_success,
@@ -281,7 +329,7 @@ def _eval_loop(params, hparams, env_cfg, state, history, img_history, policy_act
         ),
     )
     timeout = timeout | (~done & ~success & ~collision)
-    return returns, success, collision, timeout, lengths, min_clearance
+    return returns, success, collision, timeout, lengths, min_clearance, perception
 
 
 def _safe_mean_std(values):
@@ -318,6 +366,7 @@ def evaluate_jax_env(
     include_paper_metrics=False,
     render_cfg=None,  # [IMG]
     image_history_len=4,  # [IMG]
+    geometry=None,  # [LIDAR]
 ):
     """Run deterministic evaluation using fixed-ID observation history."""
     env_cfg = env_cfg_or_config
@@ -331,9 +380,9 @@ def evaluate_jax_env(
         raise ValueError("policy functions must be provided by the selected model")
     # [SPEED] loop compiled once and reused; pass the same hparams/env_cfg objects each call to hit the cache
     loop_fn = _cached_eval_loop(hparams, env_cfg, policy_action_mean_fn, policy_action_to_env_action_fn,
-                                render_cfg, image_history_len)  # [IMG] render settings are part of the key
+                                render_cfg, image_history_len, geometry)  # [IMG] render settings are part of the key
 
-    returns, success, collision, timeout, lengths, min_clearance = _evaluate_seed_values(
+    returns, success, collision, timeout, lengths, min_clearance, perception = _evaluate_seed_values(
         params,
         hparams,
         env_cfg,
@@ -343,6 +392,7 @@ def evaluate_jax_env(
         render_cfg=render_cfg,  # [IMG]
         image_history_len=image_history_len,  # [IMG]
         loop_fn=loop_fn,  # [SPEED]
+        geometry=geometry,  # [LIDAR]
     )
     returns_np = np.asarray(returns, dtype=np.float32)
     success_np = np.asarray(success, dtype=np.float32)
@@ -360,4 +410,12 @@ def evaluate_jax_env(
     }
     if include_paper_metrics:
         metrics.update(_paper_metric_summary(success_np, lengths_np, min_clearance_np, float(env_cfg.dt)))
+    if perception is not None:  # [LIDAR] errors near the robot, averaged over all evaluated steps
+        p = {k: float(np.sum(np.asarray(v))) for k, v in perception.items()}
+        metrics.update({
+            "perception_pos_err": p["pos_err_sum"] / max(p["matched"], 1.0),
+            "perception_vel_err": p["vel_err_sum"] / max(p["matched"], 1.0),
+            "perception_missed": p["missed"] / max(p["steps"], 1.0),
+            "perception_false_tracks": p["false_tracks"] / max(p["steps"], 1.0),
+        })
     return metrics

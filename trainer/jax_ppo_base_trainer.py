@@ -22,6 +22,7 @@ from env.jax_image_renderer import (  # [IMG] renderer config + initial image hi
     render_config_from_omegaconf,
     render_policy_frame,
 )
+from env import jax_tracker  # [LIDAR]
 from model import get_jax_model_module
 from trainer.jax_checkpoint import save_jax_checkpoint
 from trainer.jax_platform import (
@@ -421,6 +422,14 @@ class JaxTrainerBase:
             "alpha_active_std",
             "r_safe_sum",
             "r_safe_count",
+            "lidar_pos_err_sum",  # [LIDAR]
+            "lidar_pos_err_count",
+            "lidar_vel_err_sum",
+            "lidar_vel_err_count",
+            "lidar_missed_sum",
+            "lidar_missed_count",
+            "lidar_false_tracks_sum",
+            "lidar_false_tracks_count",
         ) if key in batch)
         if "nominal_cbf_residual_sum" in batch:
             diagnostic_keys += (
@@ -500,6 +509,11 @@ class JaxTrainerBase:
                     summary, "alpha_active_std"
                 ),
             })
+        if "lidar_pos_err_sum" in summary:  # [LIDAR]
+            metrics.update({
+                name: JaxPPOBaseTrainer._summary_mean(summary, name)
+                for name in ("lidar_pos_err", "lidar_vel_err", "lidar_missed", "lidar_false_tracks")
+            })
         if "nominal_cbf_residual_sum" in summary:
             metrics.update({
                 "nominal_cbf_residual_mean": JaxPPOBaseTrainer._summary_mean(summary, "nominal_cbf_residual"),
@@ -575,6 +589,11 @@ class JaxTrainerBase:
             "diagnostics/robot_omega_delta_max": train_metrics["robot_omega_delta_max"],
             "diagnostics/robot_omega_delta_penalty_mean": train_metrics["robot_omega_delta_penalty_mean"],
         }
+        if "lidar_pos_err" in train_metrics:  # [LIDAR] perception error near the robot (ground truth used only here)
+            log_dict.update({
+                f"perception/{name[len('lidar_'):]}": train_metrics[name]
+                for name in ("lidar_pos_err", "lidar_vel_err", "lidar_missed", "lidar_false_tracks")
+            })
         if "qp_slack_mean" in train_metrics:
             log_dict.update({
                 "diagnostics/qp_slack_mean": train_metrics["qp_slack_mean"],
@@ -640,6 +659,9 @@ class JaxTrainerBase:
             log_dict["charts/eval_success_rate"] = eval_metrics["success_rate"]
             log_dict["charts/eval_collision_rate"] = eval_metrics["collision_rate"]
             log_dict["charts/eval_timeout_rate"] = eval_metrics["timeout_rate"]
+            for name in ("perception_pos_err", "perception_vel_err", "perception_missed", "perception_false_tracks"):
+                if name in eval_metrics:  # [LIDAR]
+                    log_dict[f"charts/eval_{name}"] = eval_metrics[name]
 
         wandb_log = {key: value for key, value in log_dict.items() if not key.startswith("train/")}
         if completed > 0 and periodic_log:
@@ -658,6 +680,7 @@ class JaxTrainerBase:
             policy_action_to_env_action_fn=self.model_module.policy_action_to_env_action,
             render_cfg=self.render_cfg,  # [IMG] None for MLP/GNN -> eval is unchanged
             image_history_len=self.image_history_len,  # [IMG]
+            geometry=self.geometry,  # [LIDAR] None = ground-truth QP geometry
         )
 
     @staticmethod
@@ -679,15 +702,22 @@ class JaxTrainerBase:
     def train(self):
         reset_key = self._next_rng_key()
         env_state = reset_env(self.jax_env_cfg, reset_key, self.num_envs)
-        env_history = init_obs_history(self.jax_env_cfg, env_state, self.history_len)
         ppo_episode_returns = jnp.zeros((self.num_envs,), dtype=jnp.float32)
+        # [LIDAR] the first frame comes from the tracker when geometry is estimated (fold_in: same reset key stream)
+        if self.geometry is not None:
+            env_history, tracker_state = jax_tracker.init_lidar_obs_history(
+                self.jax_env_cfg, self.geometry, env_state, self.history_len, reset_key
+            )
+        else:
+            env_history = init_obs_history(self.jax_env_cfg, env_state, self.history_len)
         # [IMG] image models carry an extra image history; must match the tuple make_rollout_collector unpacks
+        parts = (env_state, env_history)
         if self.render_cfg is not None:
             first_image = render_policy_frame(self.jax_env_cfg, env_state, self.render_cfg)
-            image_history = init_image_history(first_image, self.image_history_len)
-            env_state = (env_state, env_history, image_history, ppo_episode_returns)
-        else:
-            env_state = (env_state, env_history, ppo_episode_returns)
+            parts += (init_image_history(first_image, self.image_history_len),)
+        if self.geometry is not None:
+            parts += (tracker_state,)  # [LIDAR]
+        env_state = parts + (ppo_episode_returns,)
         self._replace_train_state(env_state=env_state, global_step=0)
         start_time = time.time()
         global_step = int(self.train_state.global_step)
@@ -805,10 +835,15 @@ class JaxPPOBaseTrainer(JaxTrainerBase):
         render_node = config.model.get("render", None)
         self.render_cfg = render_config_from_omegaconf(render_node) if render_node is not None else None
         self.image_history_len = int(config.model.get("image_history_len", 4))
+        # [LIDAR] model.geometry: ground_truth (default) | lidar | tracked_truth -> where the QP geometry comes from
+        self.geometry = jax_tracker.geometry_from_omegaconf(config.model, config_from_omegaconf(config))
+        if self.geometry is not None and not hasattr(self.model_module, "build_qp_context"):
+            raise ValueError("model.geometry != ground_truth needs a QP model (e.g. diff_cbf_cnn)")
         self.rollout_collector = make_rollout_collector(
             self.model_module,
             use_qp=hasattr(self.model_module, "build_qp_context"),
             render_cfg=self.render_cfg,  # [IMG]
+            geometry=self.geometry,  # [LIDAR]
         )
         super().__init__(config)
         self.total_updates = max(1, int(np.ceil(self.total_timesteps / max(self.timesteps_per_batch, 1))))

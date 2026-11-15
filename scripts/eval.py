@@ -94,10 +94,17 @@ class Evaluator:
             self._cache["env_cfg"] = config_from_omegaconf(self.config)
         return self._cache["env_cfg"]
 
+    def _geometry(self):
+        """[LIDAR] LidarGeometry or None (model.geometry: ground_truth | lidar | tracked_truth)."""
+        if "geometry" not in self._cache:
+            from env.jax_tracker import geometry_from_omegaconf
+
+            self._cache["geometry"] = geometry_from_omegaconf(self.config.model, self._env_cfg())
+        return self._cache["geometry"]
+
     def _render_settings(self):
         """[IMG] (RenderConfig or None, image_history_len). Same rule as the trainer: images only if model.render exists."""
         if "render" not in self._cache:
-            self._configure_jax()  # [IMG] must run before jax_image_renderer imports jax, or x64 stays off
             render_node = self.config.model.get("render", None)
             if render_node is None:
                 self._cache["render"] = (None, 4)
@@ -175,7 +182,8 @@ class Evaluator:
             seeds=self.seeds,
             include_paper_metrics=True,
             render_cfg=render_cfg, #[IMG]
-            image_history_len=image_history_len # [IMG]
+            image_history_len=image_history_len, # [IMG]
+            geometry=self._geometry(),  # [LIDAR]
         )
 
 # --------- Visualize --------- #
@@ -204,8 +212,12 @@ class Evaluator:
         max_steps = int(env_cfg.max_steps)
         if use_images:
             from env.jax_image_renderer import init_image_history, render_policy_frame
- 
-        def policy_step(params, policy_obs, img_hist):
+        geometry = self._geometry()  # [LIDAR]
+        use_lidar = geometry is not None
+        if use_lidar:
+            from env import jax_lidar, jax_tracker
+
+        def policy_step(params, policy_obs, img_hist, state):
             img_kw = {"image_obs": img_hist} if use_images else {}  # [IMG] ppo_cnn acts on images only
             if not has_qp_viz:
                 policy_action = model_module.policy_action_mean(params, hparams, policy_obs, **img_kw)
@@ -218,6 +230,12 @@ class Evaluator:
                 return_diagnostics=True, qp_context=qp_context, **img_kw,  # [IMG]
             )
             viz = {"qp_topk_ids": qp_context["qp_topk_ids"]}
+            if use_lidar:  # [LIDAR] the ids are tracker slots, not humans: draw the estimates instead
+                blocks = qp_context["qp_obs"][:, 6:].reshape((policy_obs.shape[0], -1, 6))
+                viz["qp_topk_ids"] = jnp.full_like(qp_context["qp_topk_ids"], -1)
+                viz["est_xy"] = state.robot_state[:, None, 0:2] - blocks[..., 0:2]  # rel = robot - estimate
+                viz["est_vel"] = blocks[..., 2:4]
+                viz["est_mask"] = blocks[..., 5]
             for name in ("r_safe", "beta", "alpha", "qp_slack", "qp_slack_max", "qp_correction"):
                 if name in diagnostics:
                     viz[name] = diagnostics[name]
@@ -226,19 +244,29 @@ class Evaluator:
         def episode(params, rng):
             rng, reset_key = jax.random.split(rng)
             state = reset_env(env_cfg, reset_key, 1)
-            frame = fixed_order_policy_obs_from_state(env_cfg, state)
-            history = jnp.repeat(frame[:, None, :], history_len, axis=1)
+            if use_lidar:  # [LIDAR] same first frame as training/eval (fold_in keeps the env key stream)
+                history, tracker = jax_tracker.init_lidar_obs_history(env_cfg, geometry, state, history_len, reset_key)
+            else:
+                frame = fixed_order_policy_obs_from_state(env_cfg, state)
+                history = jnp.repeat(frame[:, None, :], history_len, axis=1)
+                tracker = None
             img_hist = (  # [IMG] first image repeated, exactly as in training
                 init_image_history(render_policy_frame(env_cfg, state, render_cfg), image_history_len)
                 if use_images else None
             )
 
             def body(carry, _unused):
-                state, history, img_hist, rng = carry
-                action, viz = policy_step(params, history.reshape((1, -1)), img_hist)
+                state, history, img_hist, tracker, rng, prev_key = carry  # [LIDAR] prev_key: key of the last scan
+                action, viz = policy_step(params, history.reshape((1, -1)), img_hist, state)
                 rng, step_key = jax.random.split(rng)
                 next_state, reward, done, metrics = step_env(env_cfg, state, action, step_key)
-                next_frame = fixed_order_policy_obs_from_state(env_cfg, next_state)
+                if use_lidar:  # [LIDAR]
+                    next_frame, next_tracker = jax_tracker.lidar_frame_step(
+                        env_cfg, geometry, tracker, next_state, step_key, jnp.zeros((1,), dtype=bool)
+                    )
+                else:
+                    next_frame = fixed_order_policy_obs_from_state(env_cfg, next_state)
+                    next_tracker = None
                 next_history = jnp.concatenate([history[:, 1:, :], next_frame[:, None, :]], axis=1)
                 rec = {
                     "state": state,  # state BEFORE this step (what the old trace stored)
@@ -248,6 +276,12 @@ class Evaluator:
                     "collision": metrics["collision"][0] > 0.5,
                     "viz": viz,
                 }
+                if use_lidar and geometry.source == "lidar":  # [LIDAR] the scan the CURRENT state's frame came from
+                    scan = jax_lidar.simulate_scan(
+                        geometry.lidar, state.robot_state[:, 0:2], state.robot_state[:, 2], state.human_positions,
+                        state.human_radii, state.human_mask, jax.random.fold_in(prev_key, jax_tracker.LIDAR_KEY_SALT),
+                    )
+                    rec["viz"] = {**viz, "lidar_points": scan.points, "lidar_valid": scan.valid}
                 if use_images:  # [IMG]
                     next_img = render_policy_frame(env_cfg, next_state, render_cfg)
                     next_img_hist = jnp.concatenate([img_hist[:, 1:], next_img[:, None]], axis=1)
@@ -255,10 +289,10 @@ class Evaluator:
                         rec["img"] = img_hist[0, -1]  # newest frame only; the 4-frame stack is rebuilt on the host
                 else:
                     next_img_hist = None
-                return (next_state, next_history, next_img_hist, rng), rec
+                return (next_state, next_history, next_img_hist, next_tracker, rng, step_key), rec
  
-            (final_state, _h, final_img_hist, _rng), recs = jax.lax.scan(
-                body, (state, history, img_hist, rng), None, length=max_steps
+            (final_state, _h, final_img_hist, _tr, _rng, _pk), recs = jax.lax.scan(
+                body, (state, history, img_hist, tracker, rng, reset_key), None, length=max_steps
             )
             out = {"recs": recs, "final_state": final_state}
             if record_images:
@@ -320,6 +354,10 @@ class Evaluator:
             "r_safe": np.asarray(first_array("r_safe"), dtype=float),
             "beta": np.asarray(first_array("beta"), dtype=float),
             "alpha": np.asarray(first_array("alpha"), dtype=float),
+            "est_xy": np.asarray(first_array("est_xy"), dtype=float),  # [LIDAR] empty for ground truth
+            "est_mask": np.asarray(first_array("est_mask"), dtype=float),
+            "lidar_points": np.asarray(first_array("lidar_points"), dtype=float),
+            "lidar_valid": np.asarray(first_array("lidar_valid"), dtype=bool),
             "slack_mean": first_scalar("qp_slack"),
             "slack_max": first_scalar("qp_slack_max"),
             "qp_correction": first_scalar("qp_correction"),
