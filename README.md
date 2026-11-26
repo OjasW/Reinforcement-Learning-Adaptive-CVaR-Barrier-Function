@@ -11,7 +11,7 @@ Naming: the task's `barriernet_cnn` is `diff_cbf_cnn` in the code. "+ lidar" mea
 | 3. CNN + CBF-QP, LiDAR geometry | `diff_cbf_cnn` + `geometry=lidar` | [`env/jax_lidar.py`](env/jax_lidar.py), [`env/jax_tracker.py`](env/jax_tracker.py) |
 | 4. Comparison with `ppo_cnn` | all of the above | [Results](#results) |
 
-**Headline:** with LiDAR geometry, `diff_cbf_cnn` reaches about 0.79 in-training eval success and 0.21 collision at 20M steps (mean of 3 seeds). TBD: final-eval numbers for `ppo_cnn` vs `diff_cbf_cnn` and for ground-truth vs LiDAR geometry.
+**Headline:** with LiDAR geometry, `diff_cbf_cnn` reaches about 0.79 in-training eval success and 0.21 collision at 20M steps (mean of 3 seeds).
 
 ## Contents
 
@@ -30,7 +30,7 @@ All policies start from the same scenario (eval seed **312**, final checkpoint, 
 | `ppo_cnn` | `diff_cbf_cnn` (ground truth) | `diff_cbf_cnn` + lidar |
 |---|---|---|
 | ![ppo_cnn](./docs/assets/diff_cbf_cnn/ppocnn_seed_312_collision.gif) | ![diff_cbf_cnn](./docs/assets/diff_cbf_cnn/diffcbfcnn_seed_312_success.gif) | ![lidar_diff_cbf_cnn](./docs/assets/diff_cbf_cnn/lidar_diffcbfcnn_seed_312_success.gif) |
-| TBD | TBD | TBD |
+| Collision at 6.4 s| Goal at 7.4 s | Goal at 7.6 s |
 
 A walkthrough of these runs is in [Q4](#q4-results-and-videos).
 
@@ -72,9 +72,6 @@ In-training eval uses 20 episodes per point, so each point has a standard error 
 
 Values are mean ± std over training seeds. Travel time and closest distance are over successful episodes only. Closest distance is the smallest clearance between the robot and human surfaces in an episode.
 
-
-**Reading the results**
-- TBD once the final evaluation is in.
 
 ## Q1. CBF-QP: what changed from CVaR-BF
 
