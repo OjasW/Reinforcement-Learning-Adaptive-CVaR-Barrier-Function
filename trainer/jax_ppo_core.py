@@ -175,6 +175,8 @@ def brax_ppo_loss(
 ):
     full_params = _with_trainable(params, trainable_params)
     policy_action = batch["policy_act"]
+    # [IMG] forward the image history to the model when the batch has one (ppo_cnn); empty for MLP/GNN
+    img_kw = {"image_obs": batch["img"]} if "img" in batch else {}
     if "qp_obs" in batch and "qp_topk_ids" in batch:
         _action, log_prob, entropy, values = get_action_and_value_fn(
             full_params,
@@ -186,6 +188,7 @@ def brax_ppo_loss(
                 "qp_obs": batch["qp_obs"],
                 "qp_topk_ids": batch["qp_topk_ids"],
             },
+            **img_kw,  # [IMG]
         )
     else:
         _action, log_prob, entropy, values = get_action_and_value_fn(
@@ -194,6 +197,7 @@ def brax_ppo_loss(
             batch["obs"],
             action=batch["act"],
             policy_action=policy_action,
+            **img_kw,  # [IMG]
         )
     advantages = jnp.asarray(batch["advantages"], dtype=jnp.float32)
     if normalize_advantage:
